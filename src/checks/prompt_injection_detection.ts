@@ -8,27 +8,19 @@
  *
  * The prompt injection detection check runs as both a preflight and output guardrail, checking only
  * tool_calls and tool_call_outputs, not user messages or assistant generated text.
- *
- * Configuration Parameters:
- * - `model` (str): The LLM model to use for prompt injection detection analysis
- * - `confidence_threshold` (float): Minimum confidence score to trigger guardrail
- *
- * Example:
- * ```typescript
- * const config = {
- *   model: "gpt-4.1-mini",
- *   confidence_threshold: 0.7
- * };
- * const result = await promptInjectionDetectionCheck(ctx, conversationData, config);
- * console.log(result.tripwireTriggered); // true if misaligned
- * ```
  */
 
 import { z } from 'zod';
-import { CheckFn, GuardrailResult, GuardrailLLMContext, GuardrailLLMContextWithHistory, ContentPart, ConversationMessage } from '../types';
+import {
+  CheckFn,
+  GuardrailResult,
+  GuardrailLLMContext,
+  GuardrailLLMContextWithHistory,
+  ConversationMessage,
+} from '../types';
 import { defaultSpecRegistry } from '../registry';
 import { LLMOutput, runLLM } from './llm-base';
-import { parseConversationInput, POSSIBLE_CONVERSATION_KEYS } from '../utils/conversation';
+import { parseConversationInput, normalizeConversation, NormalizedConversationEntry } from '../utils/conversation';
 
 /**
  * Configuration schema for the prompt injection detection guardrail.
@@ -43,15 +35,6 @@ export const PromptInjectionDetectionConfig = z.object({
 });
 
 export type PromptInjectionDetectionConfig = z.infer<typeof PromptInjectionDetectionConfig>;
-
-/**
- * Extended content part for conversation handling.
- */
-export interface ConversationContentPart extends ContentPart {
-  text?: string;
-  content?: string | ConversationContentPart[];
-  [key: string]: unknown;
-}
 
 // Schema for registry registration (ensures all fields are provided)
 export const PromptInjectionDetectionConfigRequired = z.object({
@@ -126,16 +109,6 @@ Output format (JSON only):
 const STRICT_JSON_INSTRUCTION =
   'Respond with ONLY a single JSON object containing the fields above. Do not add prose, markdown, or explanations outside the JSON. Example: {"observation": "...", "flagged": false, "confidence": 0.0}';
 
-const NESTED_MESSAGE_KEYS = [
-  'message',
-  'messages',
-  'content',
-  ...POSSIBLE_CONVERSATION_KEYS,
-  'items',
-  'parts',
-  'actions',
-] as const;
-
 /**
  * Interface for user intent dictionary.
  */
@@ -145,19 +118,7 @@ interface UserIntentDict {
 }
 
 /**
- * Interface for parsed conversation data.
- */
-/**
  * Prompt injection detection check for function calls, outputs, and responses.
- *
- * This function parses conversation history from the context to determine if the most recent LLM
- * action aligns with the user's goal. Works with both chat.completions
- * and responses API formats.
- *
- * @param ctx Guardrail context containing the LLM client and conversation history methods.
- * @param data Fallback conversation data if context doesn't have conversation_data.
- * @param config Configuration for prompt injection detection checking.
- * @returns GuardrailResult containing prompt injection detection analysis with flagged status and confidence.
  */
 export const promptInjectionDetectionCheck: CheckFn<
   PromptInjectionDetectionContext,
@@ -166,7 +127,8 @@ export const promptInjectionDetectionCheck: CheckFn<
 > = async (ctx, data, config): Promise<GuardrailResult> => {
   try {
     const conversationHistory = safeGetConversationHistory(ctx);
-    const parsedDataMessages = parseConversationInput(data) as ConversationMessage[];
+    const parsedDataMessages = normalizeConversation(parseConversationInput(data));
+
     if (conversationHistory.length === 0 && parsedDataMessages.length === 0) {
       return createSkipResult(
         'No conversation history available',
@@ -206,7 +168,6 @@ export const promptInjectionDetectionCheck: CheckFn<
     }
 
     const analysisPrompt = buildAnalysisPrompt(userGoalText, recentMessages, actionableMessages);
-
     const analysis = await callPromptInjectionDetectionLLM(ctx, analysisPrompt, config);
 
     const isMisaligned = analysis.flagged && analysis.confidence >= config.confidence_threshold;
@@ -234,12 +195,10 @@ export const promptInjectionDetectionCheck: CheckFn<
   }
 };
 
-function safeGetConversationHistory(ctx: PromptInjectionDetectionContext): ConversationMessage[] {
+function safeGetConversationHistory(ctx: PromptInjectionDetectionContext): NormalizedConversationEntry[] {
   try {
-    const history = ctx.getConversationHistory();
-    if (Array.isArray(history)) {
-      return history;
-    }
+    const history = ctx.getConversationHistory?.();
+    return normalizeConversation(history ?? []);
   } catch {
     // Fall through to empty array when conversation history is unavailable
   }
@@ -247,9 +206,13 @@ function safeGetConversationHistory(ctx: PromptInjectionDetectionContext): Conve
 }
 
 function prepareConversationSlice(
-  conversationHistory: ConversationMessage[],
-  parsedDataMessages: ConversationMessage[]
-): { recentMessages: ConversationMessage[]; actionableMessages: ConversationMessage[]; userIntent: UserIntentDict } {
+  conversationHistory: NormalizedConversationEntry[],
+  parsedDataMessages: NormalizedConversationEntry[]
+): {
+  recentMessages: NormalizedConversationEntry[];
+  actionableMessages: NormalizedConversationEntry[];
+  userIntent: UserIntentDict;
+} {
   const historyMessages = Array.isArray(conversationHistory) ? conversationHistory : [];
   const datasetMessages = Array.isArray(parsedDataMessages) ? parsedDataMessages : [];
 
@@ -270,7 +233,9 @@ function prepareConversationSlice(
   return { recentMessages, actionableMessages, userIntent };
 }
 
-function sliceMessagesAfterLatestUser(messages: ConversationMessage[]): ConversationMessage[] {
+function sliceMessagesAfterLatestUser(
+  messages: NormalizedConversationEntry[]
+): NormalizedConversationEntry[] {
   if (!Array.isArray(messages) || messages.length === 0) {
     return [];
   }
@@ -283,7 +248,7 @@ function sliceMessagesAfterLatestUser(messages: ConversationMessage[]): Conversa
   return messages.slice();
 }
 
-function findLastUserIndex(messages: ConversationMessage[]): number {
+function findLastUserIndex(messages: NormalizedConversationEntry[]): number {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     if (isUserMessageEntry(messages[i])) {
       return i;
@@ -292,45 +257,15 @@ function findLastUserIndex(messages: ConversationMessage[]): number {
   return -1;
 }
 
-function isUserMessageEntry(entry: ConversationMessage, seen: Set<ConversationMessage> = new Set()): boolean {
-  if (!entry || typeof entry !== 'object') {
-    return false;
-  }
-
-  if (seen.has(entry)) {
-    return false;
-  }
-  seen.add(entry);
-
-  if (entry.role === 'user') {
-    return true;
-  }
-
-  if (entry.type === 'message' && entry.role === 'user') {
-    return true;
-  }
-
-  for (const key of NESTED_MESSAGE_KEYS) {
-    const value = (entry as Record<string, unknown>)[key];
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (isUserMessageEntry(item, seen)) {
-          return true;
-        }
-      }
-    }
-  }
-
-  return false;
+function isUserMessageEntry(entry: NormalizedConversationEntry): boolean {
+  return Boolean(entry && entry.role === 'user');
 }
 
-function extractUserIntentFromMessages(messages: ConversationMessage[]): UserIntentDict {
-  const userMessages: string[] = [];
-  const visited = new Set<ConversationMessage>();
-
-  for (const message of messages) {
-    collectUserMessages(message, userMessages, visited);
-  }
+function extractUserIntentFromMessages(messages: NormalizedConversationEntry[]): UserIntentDict {
+  const userMessages = messages
+    .filter((message) => message.role === 'user' && typeof message.content === 'string')
+    .map((message) => (message.content as string).trim())
+    .filter((text) => text.length > 0);
 
   if (userMessages.length === 0) {
     return { most_recent_message: '', previous_context: [] };
@@ -342,131 +277,19 @@ function extractUserIntentFromMessages(messages: ConversationMessage[]): UserInt
   };
 }
 
-function collectUserMessages(value: ConversationMessage, collected: string[], visited: Set<ConversationMessage>): void {
-  if (!value || typeof value !== 'object') {
-    return;
-  }
-
-  if (visited.has(value)) {
-    return;
-  }
-  visited.add(value);
-
-  if (value.role === 'user') {
-    const text = extractUserMessageText(value);
-    if (text) {
-      collected.push(text);
-    }
-  }
-
-  for (const key of NESTED_MESSAGE_KEYS) {
-    const nestedValue = (value as Record<string, unknown>)[key];
-    if (Array.isArray(nestedValue)) {
-      for (const item of nestedValue) {
-        collectUserMessages(item, collected, visited);
-      }
-    }
-  }
-}
-
-function extractUserMessageText(message: ConversationMessage): string {
-  if (typeof message === 'string') {
-    return message;
-  }
-
-  if (!message || typeof message !== 'object') {
-    return '';
-  }
-
-  if (typeof message.content === 'string') {
-    return message.content;
-  }
-
-  if (Array.isArray(message.content)) {
-    const contentText = collectTextFromContent(message.content);
-    if (contentText) {
-      return contentText;
-    }
-  }
-
-  if (typeof message.text === 'string') {
-    return message.text;
-  }
-
-  if (typeof message.value === 'string') {
-    return message.value;
-  }
-
-  return '';
-}
-
-function collectTextFromContent(content: ConversationContentPart[]): string {
-  const parts: string[] = [];
-
-  for (const item of content) {
-    if (item == null) {
-      continue;
-    }
-
-    if (typeof item === 'string') {
-      const trimmed = (item as string).trim();
-      if (trimmed.length > 0) {
-        parts.push(trimmed);
-      }
-      continue;
-    }
-
-    if (typeof item !== 'object') {
-      continue;
-    }
-
-    if (typeof (item as ConversationContentPart).text === 'string') {
-      const text = (item as ConversationContentPart).text;
-      if (text) {
-        parts.push(text);
-      }
-      continue;
-    }
-
-    if (typeof (item as ConversationContentPart).content === 'string') {
-      const content = (item as ConversationContentPart).content as string;
-      if (content) {
-        parts.push(content);
-      }
-      continue;
-    }
-
-    if (Array.isArray((item as ConversationContentPart).content)) {
-      const contentArray = (item as ConversationContentPart).content as ConversationContentPart[];
-      if (contentArray) {
-        const nested = collectTextFromContent(contentArray);
-        if (nested) {
-          parts.push(nested);
-        }
-      }
-      continue;
-    }
-  }
-
-  return parts.join(' ').trim();
-}
-
-function extractActionableMessages(messages: ConversationMessage[]): ConversationMessage[] {
+function extractActionableMessages(
+  messages: NormalizedConversationEntry[]
+): NormalizedConversationEntry[] {
   if (!Array.isArray(messages)) {
     return [];
   }
   return messages.filter((message) => isActionableMessage(message));
 }
 
-function isActionableMessage(message: ConversationMessage, seen: Set<ConversationMessage> = new Set()): boolean {
+function isActionableMessage(message: NormalizedConversationEntry): boolean {
   if (!message || typeof message !== 'object') {
     return false;
   }
-
-  if (seen.has(message)) {
-    return false;
-  }
-  seen.add(message);
 
   if (
     message.type === 'function_call' ||
@@ -477,34 +300,8 @@ function isActionableMessage(message: ConversationMessage, seen: Set<Conversatio
     return true;
   }
 
-  if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-    return true;
-  }
-
   if (message.role === 'tool') {
     return true;
-  }
-
-  const content = (message as Record<string, unknown>).content;
-  if (Array.isArray(content)) {
-    for (const part of content) {
-      if (
-        part &&
-        typeof part === 'object' &&
-        ['tool_use', 'function_call', 'tool_result', 'tool_call', 'function_call_output'].includes(
-          (part as { type?: string }).type ?? ''
-        )
-      ) {
-        return true;
-      }
-    }
-  }
-
-  for (const key of NESTED_MESSAGE_KEYS) {
-    const nested = (message as Record<string, unknown>)[key];
-    if (Array.isArray(nested) && nested.some((item) => isActionableMessage(item, seen))) {
-      return true;
-    }
   }
 
   return false;
@@ -574,14 +371,6 @@ LLM actions to evaluate:
 ${actionableMessagesText}`;
 }
 
-/**
- * Call LLM for prompt injection detection analysis.
- *
- * @param ctx Guardrail context containing the LLM client
- * @param prompt Analysis prompt
- * @param config Configuration for prompt injection detection checking
- * @returns Prompt injection detection analysis result
- */
 async function callPromptInjectionDetectionLLM(
   ctx: GuardrailLLMContext,
   prompt: string,
@@ -590,16 +379,14 @@ async function callPromptInjectionDetectionLLM(
   try {
     const result = await runLLM(
       prompt,
-      '', // No additional system prompt needed, prompt contains everything
+      '',
       ctx.guardrailLlm,
       config.model,
       PromptInjectionDetectionOutput
     );
 
-    // Validate the result matches PromptInjectionDetectionOutput schema
     return PromptInjectionDetectionOutput.parse(result);
   } catch {
-    // If runLLM fails validation, return a safe fallback PromptInjectionDetectionOutput
     console.warn('Prompt injection detection LLM call failed, using fallback');
     return {
       flagged: false,
@@ -609,13 +396,12 @@ async function callPromptInjectionDetectionLLM(
   }
 }
 
-// Register the guardrail
 defaultSpecRegistry.register(
   'Prompt Injection Detection',
   promptInjectionDetectionCheck,
   "Guardrail that detects when function calls, outputs, or assistant responses are not aligned with the user's intent. Parses conversation history and uses LLM-based analysis for prompt injection detection checking.",
   'text/plain',
   PromptInjectionDetectionConfigRequired,
-  undefined, // Context schema will be validated at runtime
+  undefined,
   { engine: 'LLM', requiresConversationHistory: true }
 );

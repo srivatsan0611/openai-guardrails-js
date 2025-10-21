@@ -5,9 +5,10 @@
  * with periodic guardrail checks.
  */
 
-import { GuardrailResult, TextOnlyMessageArray } from './types';
+import { GuardrailResult } from './types';
 import { GuardrailsResponse, GuardrailsBaseClient, OpenAIResponseType } from './base-client';
 import { GuardrailTripwireTriggered } from './exceptions';
+import { mergeConversationWithItems, NormalizedConversationEntry } from './utils/conversation';
 
 /**
  * Mixin providing streaming functionality for guardrails clients.
@@ -21,32 +22,28 @@ export class StreamingMixin {
     llmStream: AsyncIterable<unknown>,
     preflightResults: GuardrailResult[],
     inputResults: GuardrailResult[],
-    conversationHistory?: TextOnlyMessageArray,
+    conversationHistory?: NormalizedConversationEntry[],
     checkInterval: number = 100,
     suppressTripwire: boolean = false
   ): AsyncIterableIterator<GuardrailsResponse> {
     let accumulatedText = '';
     let chunkCount = 0;
+    const baseHistory = conversationHistory ? conversationHistory.map((entry) => ({ ...entry })) : [];
 
     for await (const chunk of llmStream) {
-      // Extract text from chunk
       const chunkText = this.extractResponseText(chunk as OpenAIResponseType);
       if (chunkText) {
         accumulatedText += chunkText;
-        chunkCount++;
+        chunkCount += 1;
 
-        // Run output guardrails periodically
         if (chunkCount % checkInterval === 0) {
           try {
-            await this.runStageGuardrails(
-              'output',
-              accumulatedText,
-              conversationHistory as TextOnlyMessageArray,
-              suppressTripwire
-            );
+            const history = mergeConversationWithItems(baseHistory, [
+              { role: 'assistant', content: accumulatedText },
+            ]);
+            await this.runStageGuardrails('output', accumulatedText, history, suppressTripwire);
           } catch (error) {
             if (error instanceof GuardrailTripwireTriggered) {
-              // Create a final response with the error
               const finalResponse = this.createGuardrailsResponse(
                 chunk as OpenAIResponseType,
                 preflightResults,
@@ -61,27 +58,27 @@ export class StreamingMixin {
         }
       }
 
-      // Yield the chunk wrapped in GuardrailsResponse
       const response = this.createGuardrailsResponse(
         chunk as OpenAIResponseType,
         preflightResults,
         inputResults,
-        [] // No output results yet for streaming chunks
+        []
       );
       yield response;
     }
 
-    // Final guardrail check on complete text
     if (!suppressTripwire && accumulatedText) {
       try {
+        const history = mergeConversationWithItems(baseHistory, [
+          { role: 'assistant', content: accumulatedText },
+        ]);
         const finalOutputResults = await this.runStageGuardrails(
           'output',
           accumulatedText,
-          conversationHistory as TextOnlyMessageArray,
+          history,
           suppressTripwire
         );
 
-        // Create a final response with all results
         const finalResponse = this.createGuardrailsResponse(
           { type: 'final', accumulated_text: accumulatedText } as unknown as OpenAIResponseType,
           preflightResults,
@@ -91,7 +88,6 @@ export class StreamingMixin {
         yield finalResponse;
       } catch (error) {
         if (error instanceof GuardrailTripwireTriggered) {
-          // Create a final response with the error
           const finalResponse = this.createGuardrailsResponse(
             { type: 'final', accumulated_text: accumulatedText } as unknown as OpenAIResponseType,
             preflightResults,
@@ -114,7 +110,7 @@ export class StreamingMixin {
     llmStream: AsyncIterable<unknown>,
     preflightResults: GuardrailResult[],
     inputResults: GuardrailResult[],
-    conversationHistory?: TextOnlyMessageArray,
+    conversationHistory?: NormalizedConversationEntry[],
     suppressTripwire: boolean = false
   ): AsyncIterableIterator<GuardrailsResponse> {
     const streamingMixin = new StreamingMixin();

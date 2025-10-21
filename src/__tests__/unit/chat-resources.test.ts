@@ -22,6 +22,9 @@ vi.mock('../../streaming.js', () => ({
 }));
 
 const baseClientMock = () => {
+  const normalizedMessages = [{ role: 'user', content: 'normalized' }];
+  const normalizedString = [{ role: 'user', content: 'Tell me something' }];
+
   return {
     extractLatestUserTextMessage: vi.fn().mockReturnValue(['latest user', 1]),
     runStageGuardrails: vi.fn(),
@@ -38,6 +41,12 @@ const baseClientMock = () => {
         create: vi.fn().mockResolvedValue({ id: 'responses-api' }),
       },
     },
+    normalizeConversationHistory: vi
+      .fn()
+      .mockImplementation((payload) =>
+        typeof payload === 'string' ? normalizedString : normalizedMessages
+      ),
+    loadConversationHistoryFromPreviousResponse: vi.fn().mockResolvedValue([]),
   };
 };
 
@@ -70,7 +79,7 @@ describe('Chat resource', () => {
       1,
       'pre_flight',
       'latest user',
-      messages,
+      client.normalizeConversationHistory.mock.results[0].value,
       false,
       false
     );
@@ -78,7 +87,7 @@ describe('Chat resource', () => {
       2,
       'input',
       'latest user',
-      messages,
+      client.normalizeConversationHistory.mock.results[0].value,
       false,
       false
     );
@@ -92,7 +101,7 @@ describe('Chat resource', () => {
       { id: 'chat-response' },
       [{ stage: 'preflight' }],
       [{ stage: 'input' }],
-      messages,
+      client.normalizeConversationHistory.mock.results[0].value,
       false
     );
     expect(result).toEqual({ result: 'handled' });
@@ -124,12 +133,13 @@ describe('Responses resource', () => {
       model: 'gpt-4o',
     });
 
+    expect(client.loadConversationHistoryFromPreviousResponse).toHaveBeenCalledWith(undefined);
     expect(client.extractLatestUserTextMessage).not.toHaveBeenCalled(); // string input path
     expect(client.runStageGuardrails).toHaveBeenNthCalledWith(
       1,
       'pre_flight',
       'Tell me something',
-      undefined,
+      client.normalizeConversationHistory.mock.results[0].value,
       false,
       false
     );
@@ -137,7 +147,7 @@ describe('Responses resource', () => {
       2,
       'input',
       'Tell me something',
-      undefined,
+      client.normalizeConversationHistory.mock.results[0].value,
       false,
       false
     );
@@ -152,7 +162,7 @@ describe('Responses resource', () => {
       { id: 'responses-api' },
       [{ stage: 'preflight' }],
       [{ stage: 'input' }],
-      'Tell me something',
+      client.normalizeConversationHistory.mock.results[0].value,
       false
     );
     expect(payload).toEqual({ result: 'handled' });

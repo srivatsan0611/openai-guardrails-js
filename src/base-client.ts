@@ -6,13 +6,54 @@
  */
 
 import { OpenAI, AzureOpenAI } from 'openai';
-import { GuardrailResult, GuardrailLLMContext, TextOnlyMessageArray, TextOnlyContent, Message, ContentPart, TextContentPart } from './types';
+import { GuardrailResult, GuardrailLLMContext, Message, ContentPart, TextContentPart } from './types';
 import { ContentUtils } from './utils/content';
 import {
   GuardrailBundle,
   ConfiguredGuardrail,
   instantiateGuardrails,
 } from './runtime';
+import {
+  appendAssistantResponse,
+  normalizeConversation,
+  NormalizedConversationEntry,
+} from './utils/conversation';
+
+type UnknownFunction = (...args: unknown[]) => unknown;
+
+function toRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value === 'object' && value !== null) {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function getRecord(record: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
+  if (!record) {
+    return null;
+  }
+  return toRecord(record[key]);
+}
+
+function getFunction(record: Record<string, unknown> | null, key: string): UnknownFunction | null {
+  if (!record) {
+    return null;
+  }
+  const candidate = record[key];
+  return typeof candidate === 'function' ? (candidate as UnknownFunction) : null;
+}
+
+interface AsyncIterableLike {
+  [Symbol.asyncIterator]?: () => AsyncIterator<unknown>;
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const iterator = (value as AsyncIterableLike)[Symbol.asyncIterator];
+  return typeof iterator === 'function';
+}
 
 // Type alias for OpenAI response types
 export type OpenAIResponseType =
@@ -41,25 +82,16 @@ export class GuardrailResultsImpl implements GuardrailResults {
     public preflight: GuardrailResult[],
     public input: GuardrailResult[],
     public output: GuardrailResult[]
-  ) { }
+  ) {}
 
-  /**
-   * Get all guardrail results combined.
-   */
   get allResults(): GuardrailResult[] {
     return [...this.preflight, ...this.input, ...this.output];
   }
 
-  /**
-   * Check if any guardrails triggered tripwires.
-   */
   get tripwiresTriggered(): boolean {
     return this.allResults.some((r) => r.tripwireTriggered);
   }
 
-  /**
-   * Get only the guardrail results that triggered tripwires.
-   */
   get triggeredResults(): GuardrailResult[] {
     return this.allResults.filter((r) => r.tripwireTriggered);
   }
@@ -67,18 +99,10 @@ export class GuardrailResultsImpl implements GuardrailResults {
 
 /**
  * Wrapper around any OpenAI response with guardrail results.
- *
- * This class provides the same interface as OpenAI responses, with additional
- * guardrail results accessible via the guardrail_results attribute.
- *
- * Users should access content the same way as with OpenAI responses:
- * - For chat completions: response.choices[0].message.content
- * - For responses: response.output_text
- * - For streaming: response.choices[0].delta.content
  */
 export type GuardrailsResponse<T extends OpenAIResponseType = OpenAIResponseType> = T & {
   guardrail_results: GuardrailResults;
-}
+};
 
 /**
  * Pipeline configuration structure.
@@ -107,21 +131,18 @@ export abstract class GuardrailsBaseClient {
   protected guardrails!: StageGuardrails;
   protected context!: GuardrailLLMContext;
   protected _resourceClient!: OpenAI;
-  public raiseGuardrailErrors: boolean = false;
+  public raiseGuardrailErrors = false;
 
   /**
    * Extract the latest user text message from a conversation for text guardrails.
    *
    * This method specifically extracts text content from messages. For other content types,
    * create parallel methods like extractLatestUserImage() or extractLatestUserVideo().
-   *
-   * @param messages List of messages (can include non-text content)
-   * @returns Tuple of [message_text, message_index]. Index is -1 if no user message found.
    */
   public extractLatestUserTextMessage(messages: Message[]): [string, number] {
     const textOnlyMessages = ContentUtils.filterToTextOnly(messages);
-    
-    for (let i = textOnlyMessages.length - 1; i >= 0; i--) {
+
+    for (let i = textOnlyMessages.length - 1; i >= 0; i -= 1) {
       const message = textOnlyMessages[i];
       if (message.role === 'user') {
         const text = ContentUtils.extractTextFromMessage(message);
@@ -130,13 +151,10 @@ export abstract class GuardrailsBaseClient {
         }
       }
     }
-    
+
     return ['', -1];
   }
 
-  /**
-   * Create a GuardrailsResponse with organized results.
-   */
   protected createGuardrailsResponse<T extends OpenAIResponseType>(
     llmResponse: T,
     preflightResults: GuardrailResult[],
@@ -154,9 +172,6 @@ export abstract class GuardrailsBaseClient {
     };
   }
 
-  /**
-   * Setup guardrail infrastructure.
-   */
   protected async setupGuardrails(
     config: string | PipelineConfig,
     context?: GuardrailLLMContext
@@ -167,13 +182,6 @@ export abstract class GuardrailsBaseClient {
     this.validateContext(this.context);
   }
 
-  /**
-   * Apply pre-flight modifications to messages or text.
-   *
-   * @param data Either a list of messages or a text string
-   * @param preflightResults Results from pre-flight guardrails
-   * @returns Modified data with pre-flight changes applied
-   */
   public applyPreflightModifications(
     data: Message[] | string,
     preflightResults: GuardrailResult[]
@@ -182,14 +190,12 @@ export abstract class GuardrailsBaseClient {
       return data;
     }
 
-    // Get PII mappings from preflight results for individual text processing
     const piiMappings: Record<string, string> = {};
     for (const result of preflightResults) {
       if (result.info && 'detected_entities' in result.info) {
         const detected = result.info.detected_entities as Record<string, string[]>;
         for (const [entityType, entities] of Object.entries(detected)) {
           for (const entity of entities) {
-            // Map original PII to masked token
             piiMappings[entity] = `<${entityType}>`;
           }
         }
@@ -202,19 +208,14 @@ export abstract class GuardrailsBaseClient {
 
     const maskText = (text: string): string => {
       if (typeof text !== 'string') {
-        return text;
+        return text as unknown as string;
       }
 
       let maskedText = text;
-
-      // Sort PII entities by length (longest first) to avoid partial replacements
-      // This ensures longer matches are processed before shorter ones
       const sortedPii = Object.entries(piiMappings).sort((a, b) => b[0].length - a[0].length);
 
       for (const [originalPii, maskedToken] of sortedPii) {
         if (maskedText.includes(originalPii)) {
-          // Use split/join instead of regex to avoid regex injection
-          // This treats all characters literally and is safe from special characters
           maskedText = maskedText.split(originalPii).join(maskedToken);
         }
       }
@@ -223,53 +224,42 @@ export abstract class GuardrailsBaseClient {
     };
 
     if (typeof data === 'string') {
-      // Handle string input (for responses API)
       return maskText(data);
-    } else {
-      // Handle message list input (primarily for chat API and structured Responses API)
-      const [, latestUserIdx] = this.extractLatestUserTextMessage(data);
-      if (latestUserIdx === -1) {
-        return data;
-      }
-
-      // Use shallow copy for efficiency - we only modify the content field of one message
-      const modifiedMessages = [...data];
-      const currentContent = data[latestUserIdx].content;
-
-      // Apply modifications based on content type
-      let modifiedContent: string | ContentPart[];
-      if (typeof currentContent === 'string') {
-        // Plain string content - mask individually
-        modifiedContent = maskText(currentContent);
-      } else if (Array.isArray(currentContent)) {
-        // Structured content - mask each text part individually
-        modifiedContent = currentContent.map(part => {
-          if (ContentUtils.isText(part)) {
-            const textPart = part as TextContentPart;
-            return { ...textPart, text: maskText(textPart.text) };
-          }
-          return part; // Keep non-text parts unchanged
-        });
-      } else {
-        // Unknown content type - skip modifications
-        return data;
-      }
-
-      // Only modify the specific message that needs content changes
-      if (modifiedContent !== currentContent) {
-        modifiedMessages[latestUserIdx] = {
-          ...modifiedMessages[latestUserIdx],
-          content: modifiedContent,
-        };
-      }
-
-      return modifiedMessages;
     }
+
+    const [, latestUserIdx] = this.extractLatestUserTextMessage(data);
+    if (latestUserIdx === -1) {
+      return data;
+    }
+
+    const modifiedMessages = [...data];
+    const currentContent = data[latestUserIdx].content;
+    let modifiedContent: string | ContentPart[];
+
+    if (typeof currentContent === 'string') {
+      modifiedContent = maskText(currentContent);
+    } else if (Array.isArray(currentContent)) {
+      modifiedContent = currentContent.map((part) => {
+        if (ContentUtils.isText(part)) {
+          const textPart = part as TextContentPart;
+          return { ...textPart, text: maskText(textPart.text) };
+        }
+        return part;
+      });
+    } else {
+      return data;
+    }
+
+    if (modifiedContent !== currentContent) {
+      modifiedMessages[latestUserIdx] = {
+        ...modifiedMessages[latestUserIdx],
+        content: modifiedContent,
+      };
+    }
+
+    return modifiedMessages;
   }
 
-  /**
-   * Instantiate guardrails for all stages.
-   */
   protected async instantiateAllGuardrails(): Promise<StageGuardrails> {
     const guardrails: StageGuardrails = {
       pre_flight: [],
@@ -279,51 +269,34 @@ export abstract class GuardrailsBaseClient {
 
     for (const stageName of ['pre_flight', 'input', 'output'] as const) {
       const stage = this.pipeline[stageName];
-      if (stage) {
-        guardrails[stageName] = await instantiateGuardrails(stage);
-      } else {
-        guardrails[stageName] = [];
-      }
+      guardrails[stageName] = stage ? await instantiateGuardrails(stage) : [];
     }
 
     return guardrails;
   }
 
-  /**
-   * Validate context against all guardrails.
-   */
   protected validateContext(context: GuardrailLLMContext): void {
-    // Implementation would validate that context meets requirements for all guardrails
-    // For now, we just check that it has the required guardrailLlm property
     if (!context.guardrailLlm) {
       throw new Error('Context must have a guardrailLlm property');
     }
   }
 
-  /**
-   * Extract text content from various response types.
-   */
   protected extractResponseText(response: OpenAIResponseType): string {
-    // Handle Response type (no choices property)
     if ('output' in response) {
       return response.output_text || '';
     }
-    
-    // Handle other response types with choices
+
     if ('choices' in response && response.choices) {
       const choice0 = response.choices[0];
-      
-      // Handle ChatCompletion
+
       if ('message' in choice0 && choice0.message) {
         return choice0.message.content || '';
       }
-      
-      // Handle Completion
+
       if ('text' in choice0 && choice0.text) {
         return choice0.text;
       }
-      
-      // Handle streaming responses (ChatCompletionChunk)
+
       if ('delta' in choice0 && choice0.delta) {
         return choice0.delta.content || '';
       }
@@ -332,127 +305,86 @@ export abstract class GuardrailsBaseClient {
     return '';
   }
 
-  /**
-   * Load pipeline configuration from string or object.
-   */
   protected async loadPipelineBundles(config: string | PipelineConfig): Promise<PipelineConfig> {
-    // Use the enhanced loadPipelineBundles from runtime.ts
     const { loadPipelineBundles } = await import('./runtime.js');
-    return await loadPipelineBundles(config);
+    return loadPipelineBundles(config);
   }
 
-  /**
-   * Create default context with guardrail_llm client.
-   *
-   * This method should be overridden by subclasses to provide the correct type.
-   */
   protected abstract createDefaultContext(): GuardrailLLMContext;
 
-  /**
-   * Initialize client with common setup.
-   *
-   * @param config Pipeline configuration
-   * @param openaiArgs OpenAI client arguments
-   * @param clientClass The OpenAI client class to instantiate for resources
-   */
   public async initializeClient(
     config: string | PipelineConfig,
     openaiArgs: ConstructorParameters<typeof OpenAI>[0],
     clientClass: typeof OpenAI | typeof AzureOpenAI
   ): Promise<void> {
-    // Create a separate OpenAI client instance for resource access
-    // This avoids circular reference issues when overriding OpenAI's resource properties
     this._resourceClient = new clientClass(openaiArgs);
-
-    // Setup guardrails after OpenAI initialization
     await this.setupGuardrails(config);
-
-    // Override chat and responses after parent initialization
     this.overrideResources();
   }
 
-  /**
-   * Override chat and responses with our guardrail-enhanced versions.
-   * Must be implemented by subclasses.
-   */
   protected abstract overrideResources(): void;
 
-
-  /**
-   * Determine if a guardrail should run based on content type compatibility.
-   * 
-   * Currently only supports text/plain content type matching.
-   * 
-   * @future To extend for multi-modal support:
-   * - Add image/*, audio/*, video/* pattern matching
-   * - Implement content type hierarchy (image/* matches image/jpeg, etc.)
-   * - Add wildcard support for broader compatibility
-   */
   private shouldRunGuardrail(guardrail: ConfiguredGuardrail, detectedContentType: string): boolean {
     return guardrail.definition.mediaType === detectedContentType;
   }
 
-
-  /**
-   * Run guardrails for a specific pipeline stage.
-   */
   public async runStageGuardrails(
     stageName: 'pre_flight' | 'input' | 'output',
     text: string,
-    conversationHistory?: Message[],
+    conversationHistory?: unknown,
     suppressTripwire: boolean = false,
     raiseGuardrailErrors: boolean = false
   ): Promise<GuardrailResult[]> {
-    if (this.guardrails[stageName].length === 0) {
+    if (!this.guardrails?.[stageName] || this.guardrails[stageName].length === 0) {
       return [];
     }
 
     try {
-      // Content type detection - currently text-only
-      // @future: Add content analysis for multi-modal support (images, audio, video)
       const detectedContentType = 'text/plain';
-      
-      // Filter guardrails based on content type compatibility
-      const compatibleGuardrails = this.guardrails[stageName].filter(guardrail => 
+
+      const compatibleGuardrails = this.guardrails[stageName].filter((guardrail) =>
         this.shouldRunGuardrail(guardrail, detectedContentType)
       );
 
-      const skippedGuardrails = this.guardrails[stageName].filter(guardrail => 
-        !this.shouldRunGuardrail(guardrail, detectedContentType)
+      const skippedGuardrails = this.guardrails[stageName].filter(
+        (guardrail) => !this.shouldRunGuardrail(guardrail, detectedContentType)
       );
 
-      // Log warnings for skipped guardrails
       if (skippedGuardrails.length > 0) {
         console.warn(
           `⚠️  Guardrails Warning: ${skippedGuardrails.length} guardrails skipped due to content type mismatch ` +
-          `(detected: ${detectedContentType}). Skipped: ${skippedGuardrails.map(g => g.definition.name).join(', ')}`
+            `(detected: ${detectedContentType}). Skipped: ${skippedGuardrails
+              .map((g) => g.definition.name)
+              .join(', ')}`
         );
       }
 
       if (compatibleGuardrails.length === 0) {
-        console.warn(`No guardrails compatible with content type '${detectedContentType}' for stage '${stageName}'`);
+        console.warn(
+          `No guardrails compatible with content type '${detectedContentType}' for stage '${stageName}'`
+        );
         return [];
       }
 
-      // Check if any guardrail requires conversation history and we have it available
       const needsConversationHistory = compatibleGuardrails.some(
         (guardrail) => guardrail.definition.metadata?.requiresConversationHistory
       );
 
       let ctx = this.context;
-      if (needsConversationHistory && conversationHistory) {
-        // Filter to text-only for conversation history processing
-        const textOnlyHistory = ContentUtils.filterToTextOnly(conversationHistory);
-        ctx = this.createContextWithConversation(textOnlyHistory);
+      let normalizedHistory: NormalizedConversationEntry[] = [];
+
+      if (needsConversationHistory && conversationHistory !== undefined) {
+        normalizedHistory = this.normalizeConversationHistory(conversationHistory);
+        if (normalizedHistory.length > 0) {
+          ctx = this.createContextWithConversation(normalizedHistory);
+        }
       }
 
       const results: GuardrailResult[] = [];
 
-      // Run compatible guardrails in parallel using Promise.allSettled to capture all results
       const guardrailPromises = compatibleGuardrails.map(async (guardrail) => {
         try {
           const result = await guardrail.run(ctx, text);
-          // Add stage and guardrail metadata
           result.info = {
             ...result.info,
             stage_name: stageName,
@@ -463,13 +395,12 @@ export abstract class GuardrailsBaseClient {
           return result;
         } catch (error) {
           console.error(`Error running guardrail ${guardrail.definition.name}:`, error);
-          // Return a failed result instead of throwing
           return {
             tripwireTriggered: false,
             executionFailed: true,
             originalException: error instanceof Error ? error : new Error(String(error)),
             info: {
-              checked_text: text, // Return original text on error
+              checked_text: text,
               stage_name: stageName,
               guardrail_name: guardrail.definition.name,
               media_type: guardrail.definition.mediaType,
@@ -480,28 +411,21 @@ export abstract class GuardrailsBaseClient {
         }
       });
 
-      // Wait for all guardrails to complete
       const settledResults = await Promise.allSettled(guardrailPromises);
 
-      // Extract successful results
       for (const settledResult of settledResults) {
         if (settledResult.status === 'fulfilled') {
           results.push(settledResult.value);
         }
       }
 
-      // Check for guardrail execution failures and re-raise if configured
       if (raiseGuardrailErrors) {
         const executionFailures = results.filter((r) => r.executionFailed);
-
         if (executionFailures.length > 0) {
-          // Re-raise the first execution failure
-          console.debug('Re-raising guardrail execution error due to raiseGuardrailErrors=true');
           throw executionFailures[0].originalException;
         }
       }
 
-      // Check for tripwire triggers unless suppressed
       if (!suppressTripwire) {
         for (const result of results) {
           if (result.tripwireTriggered) {
@@ -524,95 +448,141 @@ export abstract class GuardrailsBaseClient {
     }
   }
 
-  /**
-   * Create a context with conversation history for guardrails that require it.
-   * 
-   * @future To extend for multi-modal support:
-   * - Add support for image/audio content in conversation history
-   * - Implement content type filtering based on guardrail requirements
-   * - Add metadata about content types in the context
-   */
-  protected createContextWithConversation(conversationHistory: TextOnlyMessageArray): GuardrailLLMContext {
-    // Create a new context that includes conversation history and tracking metadata
+  protected createContextWithConversation(
+    conversationHistory: NormalizedConversationEntry[]
+  ): GuardrailLLMContext {
     return {
       guardrailLlm: this.context.guardrailLlm,
-      // Add conversation history methods
       getConversationHistory: () => conversationHistory,
     } as GuardrailLLMContext & {
-      getConversationHistory(): TextOnlyMessageArray;
+      getConversationHistory(): NormalizedConversationEntry[];
     };
   }
 
-  /**
-   * Append LLM response to conversation history.
-   */
   protected appendLlmResponseToConversation(
-    conversationHistory: TextOnlyMessageArray | string | null,
+    conversationHistory: NormalizedConversationEntry[] | string | null | undefined,
     llmResponse: OpenAIResponseType
-  ): TextOnlyMessageArray {
-    if (!conversationHistory) {
-      conversationHistory = [];
+  ): NormalizedConversationEntry[] {
+    const normalized =
+      conversationHistory !== null && conversationHistory !== undefined
+        ? this.normalizeConversationHistory(conversationHistory)
+        : [];
+
+    return appendAssistantResponse(normalized, llmResponse);
+  }
+
+  public normalizeConversationHistory(payload: unknown): NormalizedConversationEntry[] {
+    return normalizeConversation(payload);
+  }
+
+  public async loadConversationHistoryFromPreviousResponse(
+    previousResponseId?: string | null
+  ): Promise<NormalizedConversationEntry[]> {
+    if (!previousResponseId || typeof previousResponseId !== 'string' || previousResponseId.trim() === '') {
+      return [];
     }
 
-    // Handle case where conversation_history is a string (from single input)
-    if (typeof conversationHistory === 'string') {
-      conversationHistory = [{ role: 'user', content: conversationHistory }];
+    const items = await this.collectConversationItems(previousResponseId);
+    if (!items || items.length === 0) {
+      return [];
     }
 
-    // Make a copy to avoid modifying the original
-    const updatedHistory = [...conversationHistory];
+    return this.normalizeConversationHistory(items);
+  }
 
-    // For responses API: append the output directly
-    if ('output' in llmResponse && llmResponse.output && Array.isArray(llmResponse.output)) {
-      // Convert ResponseOutputItem to TextOnlyMessage format
-      const convertedOutput = llmResponse.output
-        .filter(item => 'role' in item && 'content' in item)
-        .map(item => {
-          const itemWithRole = item as { role: string; content: unknown };
-          return {
-            role: itemWithRole.role,
-            content: itemWithRole.content as TextOnlyContent
-          };
-        });
-      updatedHistory.push(...convertedOutput);
-    }
-    // For chat completions: append the choice message directly (prompt injection detection check will parse)
-    else if (
-      'choices' in llmResponse &&
-      llmResponse.choices &&
-      Array.isArray(llmResponse.choices) &&
-      llmResponse.choices.length > 0 &&
-      'message' in llmResponse.choices[0] &&
-      llmResponse.choices[0].message &&
-      llmResponse.choices[0].message.content
-    ) {
-      const message = llmResponse.choices[0].message;
-      if (message.content) {
-        updatedHistory.push({
-          role: message.role,
-          content: message.content
-        });
+  private async collectConversationItems(previousResponseId: string): Promise<unknown[]> {
+    const items: unknown[] = [];
+
+    const clientRecord = toRecord(this._resourceClient);
+    const responsesRecord = getRecord(clientRecord, 'responses');
+    const conversationsRecord = getRecord(clientRecord, 'conversations');
+
+    let response: unknown;
+    const retrieve = getFunction(responsesRecord, 'retrieve');
+    if (retrieve) {
+      try {
+        response = await retrieve(previousResponseId);
+      } catch {
+        return items;
       }
     }
 
-    return updatedHistory;
+    if (!response) {
+      return items;
+    }
+
+    const responseRecord = toRecord(response);
+    const conversation = responseRecord ? toRecord(responseRecord.conversation) : null;
+    const conversationIdValue = conversation?.id;
+    const conversationId = typeof conversationIdValue === 'string' ? conversationIdValue : null;
+    const conversationItems = conversation ? getRecord(conversationsRecord, 'items') : null;
+    const listConversationItems = getFunction(conversationItems, 'list');
+
+    if (conversationId && listConversationItems) {
+      try {
+        const pageResult = await listConversationItems(conversationId, { order: 'asc', limit: 100 });
+        if (isAsyncIterable(pageResult)) {
+          for await (const entry of pageResult) {
+            items.push(entry);
+          }
+        } else {
+          const resultRecord = toRecord(pageResult);
+          const data = resultRecord?.data;
+          if (Array.isArray(data)) {
+            items.push(...data);
+          }
+        }
+      } catch {
+        // Ignore and fall back to input items
+      }
+    }
+
+    if (items.length === 0) {
+      const inputItemsRecord = responsesRecord ? getRecord(responsesRecord, 'inputItems') : null;
+      const listInputItems = getFunction(inputItemsRecord, 'list');
+
+      if (listInputItems) {
+        try {
+          const pageResult = await listInputItems(previousResponseId, { order: 'asc', limit: 100 });
+          if (isAsyncIterable(pageResult)) {
+            for await (const entry of pageResult) {
+              if (entry != null) {
+                items.push(entry);
+              }
+            }
+          } else {
+            const resultRecord = toRecord(pageResult);
+            const data = resultRecord?.data;
+            if (Array.isArray(data)) {
+              items.push(...data.filter((item) => item != null));
+            }
+          }
+        } catch {
+          // Ignore, items remain empty
+        }
+      }
+
+      const outputItems = responseRecord?.output;
+      if (Array.isArray(outputItems)) {
+        items.push(...outputItems.filter((item) => item != null));
+      }
+    }
+
+    return items;
   }
 
-  /**
-   * Handle non-streaming LLM response with output guardrails.
-   */
   protected async handleLlmResponse<T extends OpenAIResponseType>(
     llmResponse: T,
     preflightResults: GuardrailResult[],
     inputResults: GuardrailResult[],
-    conversationHistory?: TextOnlyMessageArray,
+    conversationHistory?: unknown,
     suppressTripwire: boolean = false
   ): Promise<GuardrailsResponse<T>> {
-    // Create complete conversation history including the LLM response
-    const completeConversation = this.appendLlmResponseToConversation(
-      conversationHistory || null,
-      llmResponse
-    );
+    const normalizedHistory =
+      conversationHistory !== undefined && conversationHistory !== null
+        ? this.normalizeConversationHistory(conversationHistory)
+        : [];
+    const completeConversation = this.appendLlmResponseToConversation(normalizedHistory, llmResponse);
 
     const responseText = this.extractResponseText(llmResponse);
     const outputResults = await this.runStageGuardrails(
@@ -622,11 +592,6 @@ export abstract class GuardrailsBaseClient {
       suppressTripwire
     );
 
-    return this.createGuardrailsResponse(
-      llmResponse,
-      preflightResults,
-      inputResults,
-      outputResults
-    );
+    return this.createGuardrailsResponse(llmResponse, preflightResults, inputResults, outputResults);
   }
 }

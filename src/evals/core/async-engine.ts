@@ -7,8 +7,8 @@
 
 import { Context, RunEngine, Sample, SampleResult } from './types';
 import { ConfiguredGuardrail } from '../../runtime';
-import { GuardrailLLMContextWithHistory, GuardrailResult, GuardrailLLMContext, ConversationMessage } from '../../types';
-import { parseConversationInput } from '../../utils/conversation';
+import { GuardrailLLMContextWithHistory, GuardrailResult, GuardrailLLMContext } from '../../types';
+import { parseConversationInput, normalizeConversation, NormalizedConversationEntry } from '../../utils/conversation';
 
 /**
  * Runs guardrail evaluations asynchronously.
@@ -147,7 +147,7 @@ export class AsyncRunEngine implements RunEngine {
     guardrail: ConfiguredGuardrail,
     sampleData: string
   ): Promise<GuardrailResult> {
-    const conversation = parseConversationInput(sampleData) as ConversationMessage[];
+    const conversation = normalizeConversation(parseConversationInput(sampleData));
 
     if (conversation.length === 0) {
       const guardrailContext = this.createPromptInjectionContext(context, []);
@@ -194,7 +194,7 @@ export class AsyncRunEngine implements RunEngine {
 
   private createPromptInjectionContext(
     context: Context,
-    conversationHistory: ConversationMessage[]
+    conversationHistory: NormalizedConversationEntry[]
   ): GuardrailLLMContextWithHistory {
     return {
       guardrailLlm: context.guardrailLlm,

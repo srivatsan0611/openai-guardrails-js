@@ -5,6 +5,7 @@
 import { OpenAI } from 'openai';
 import { GuardrailsBaseClient, GuardrailsResponse } from '../../base-client';
 import { Message } from '../../types';
+import { mergeConversationWithItems } from '../../utils/conversation';
 
 /**
  * Responses API with guardrails.
@@ -50,6 +51,16 @@ export class Responses {
   ): Promise<GuardrailsResponse<OpenAI.Responses.Response> | AsyncIterableIterator<GuardrailsResponse>> {
     const { input, model, stream = false, tools, suppressTripwire = false, ...kwargs } = params;
 
+    const extraOptions = kwargs as Record<string, unknown>;
+    const previousResponseIdValue =
+      extraOptions['previous_response_id'] ?? extraOptions['previousResponseId'];
+    const previousResponseId =
+      typeof previousResponseIdValue === 'string' ? previousResponseIdValue : undefined;
+    const priorHistory = await this.client.loadConversationHistoryFromPreviousResponse(previousResponseId);
+    const currentTurn = this.client.normalizeConversationHistory(input);
+    const normalizedConversation =
+      priorHistory.length > 0 ? mergeConversationWithItems(priorHistory, currentTurn) : currentTurn;
+
     // Determine latest user message text when a list of messages is provided
     let latestMessage: string;
     if (Array.isArray(input)) {
@@ -58,14 +69,11 @@ export class Responses {
       latestMessage = input;
     }
 
-    // Extract conversation history for guardrail processing
-    const conversationHistory = Array.isArray(input) ? input : undefined;
-
     // Preflight first (run checks on the latest user message text, with full conversation)
     const preflightResults = await this.client.runStageGuardrails(
       'pre_flight',
       latestMessage,
-      conversationHistory,
+      normalizedConversation,
       suppressTripwire,
       this.client.raiseGuardrailErrors
     );
@@ -81,7 +89,7 @@ export class Responses {
       this.client.runStageGuardrails(
         'input',
         latestMessage,
-        conversationHistory,
+        normalizedConversation,
         suppressTripwire,
         this.client.raiseGuardrailErrors
       ),
@@ -105,7 +113,7 @@ export class Responses {
         llmResponse,
         preflightResults,
         inputResults,
-        input,
+        normalizedConversation,
         suppressTripwire
       );
     } else {
@@ -114,7 +122,7 @@ export class Responses {
         llmResponse,
         preflightResults,
         inputResults,
-        input,
+        normalizedConversation,
         suppressTripwire
       );
     }

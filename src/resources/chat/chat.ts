@@ -64,12 +64,13 @@ export class ChatCompletions {
 
     // Extract latest user message text for guardrails (guardrails only work with text content)
     const [latestMessage] = this.client.extractLatestUserTextMessage(messages);
+    const normalizedConversation = this.client.normalizeConversationHistory(messages);
 
     // Preflight first
     const preflightResults = await this.client.runStageGuardrails(
       'pre_flight',
       latestMessage,
-      messages,
+      normalizedConversation,
       suppressTripwire,
       this.client.raiseGuardrailErrors
     );
@@ -85,7 +86,7 @@ export class ChatCompletions {
       this.client.runStageGuardrails(
         'input',
         latestMessage,
-        messages,
+        normalizedConversation,
         suppressTripwire,
         this.client.raiseGuardrailErrors
       ),
@@ -109,7 +110,7 @@ export class ChatCompletions {
         llmResponse,
         preflightResults,
         inputResults,
-        messages,
+        normalizedConversation,
         suppressTripwire
       );
     } else {
@@ -119,7 +120,7 @@ export class ChatCompletions {
         llmResponse,
         preflightResults,
         inputResults,
-        messages,
+        normalizedConversation,
         suppressTripwire
       );
     }
