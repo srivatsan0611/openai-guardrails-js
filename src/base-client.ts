@@ -5,16 +5,14 @@
  * async and sync guardrails clients.
  */
 
-import { OpenAI } from 'openai';
-import { GuardrailResult, GuardrailLLMContext } from './types';
+import { OpenAI, AzureOpenAI } from 'openai';
+import { GuardrailResult, GuardrailLLMContext, TextOnlyMessageArray, TextOnlyContent, Message, ContentPart, TextContentPart } from './types';
+import { ContentUtils } from './utils/content';
 import {
-  loadConfigBundle,
-  runGuardrails,
-  instantiateGuardrails,
   GuardrailBundle,
   ConfiguredGuardrail,
+  instantiateGuardrails,
 } from './runtime';
-import { defaultSpecRegistry } from './registry';
 
 // Type alias for OpenAI response types
 export type OpenAIResponseType =
@@ -112,57 +110,27 @@ export abstract class GuardrailsBaseClient {
   public raiseGuardrailErrors: boolean = false;
 
   /**
-   * Extract the latest user message text and its index from a list of message-like items.
+   * Extract the latest user text message from a conversation for text guardrails.
    *
-   * Supports both dict-based messages (OpenAI) and object models with
-   * role/content attributes. Handles Responses API content-part format.
+   * This method specifically extracts text content from messages. For other content types,
+   * create parallel methods like extractLatestUserImage() or extractLatestUserVideo().
    *
-   * @param messages List of messages
+   * @param messages List of messages (can include non-text content)
    * @returns Tuple of [message_text, message_index]. Index is -1 if no user message found.
    */
-  public extractLatestUserMessage(messages: any[]): [string, number] {
-    const getAttr = (obj: any, key: string): any => {
-      if (typeof obj === 'object' && obj !== null) {
-        return obj[key];
-      }
-      return undefined;
-    };
-
-    const contentToText = (content: any): string => {
-      // String content
-      if (typeof content === 'string') {
-        return content.trim();
-      }
-      // List of content parts (Responses API)
-      if (Array.isArray(content)) {
-        const parts: string[] = [];
-        for (const part of content) {
-          if (typeof part === 'object' && part !== null) {
-            const partType = part.type;
-            const textVal = part.text || '';
-            if (
-              ['input_text', 'text', 'output_text', 'summary_text'].includes(partType) &&
-              typeof textVal === 'string'
-            ) {
-              parts.push(textVal);
-            }
-          }
+  public extractLatestUserTextMessage(messages: Message[]): [string, number] {
+    const textOnlyMessages = ContentUtils.filterToTextOnly(messages);
+    
+    for (let i = textOnlyMessages.length - 1; i >= 0; i--) {
+      const message = textOnlyMessages[i];
+      if (message.role === 'user') {
+        const text = ContentUtils.extractTextFromMessage(message);
+        if (text) {
+          return [text, i];
         }
-        return parts.join(' ').trim();
-      }
-      return '';
-    };
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i];
-      const role = getAttr(message, 'role');
-      if (role === 'user') {
-        const content = getAttr(message, 'content');
-        const messageText = contentToText(content);
-        return [messageText, i];
       }
     }
-
+    
     return ['', -1];
   }
 
@@ -207,9 +175,9 @@ export abstract class GuardrailsBaseClient {
    * @returns Modified data with pre-flight changes applied
    */
   public applyPreflightModifications(
-    data: any[] | string,
+    data: Message[] | string,
     preflightResults: GuardrailResult[]
-  ): any[] | string {
+  ): Message[] | string {
     if (preflightResults.length === 0) {
       return data;
     }
@@ -259,45 +227,29 @@ export abstract class GuardrailsBaseClient {
       return maskText(data);
     } else {
       // Handle message list input (primarily for chat API and structured Responses API)
-      const [, latestUserIdx] = this.extractLatestUserMessage(data);
+      const [, latestUserIdx] = this.extractLatestUserTextMessage(data);
       if (latestUserIdx === -1) {
         return data;
       }
 
       // Use shallow copy for efficiency - we only modify the content field of one message
       const modifiedMessages = [...data];
-
-      // Extract current content safely
-      const currentContent = data[latestUserIdx]?.content;
+      const currentContent = data[latestUserIdx].content;
 
       // Apply modifications based on content type
-      let modifiedContent: any;
+      let modifiedContent: string | ContentPart[];
       if (typeof currentContent === 'string') {
         // Plain string content - mask individually
         modifiedContent = maskText(currentContent);
       } else if (Array.isArray(currentContent)) {
         // Structured content - mask each text part individually
-        modifiedContent = [];
-        for (const part of currentContent) {
-          if (typeof part === 'object' && part !== null) {
-            const partType = part.type;
-            if (
-              ['input_text', 'text', 'output_text', 'summary_text'].includes(partType) &&
-              'text' in part
-            ) {
-              // Mask this specific text part individually
-              const originalText = part.text;
-              const maskedText = maskText(originalText);
-              modifiedContent.push({ ...part, text: maskedText });
-            } else {
-              // Keep non-text parts unchanged
-              modifiedContent.push(part);
-            }
-          } else {
-            // Keep unknown parts unchanged
-            modifiedContent.push(part);
+        modifiedContent = currentContent.map(part => {
+          if (ContentUtils.isText(part)) {
+            const textPart = part as TextContentPart;
+            return { ...textPart, text: maskText(textPart.text) };
           }
-        }
+          return part; // Keep non-text parts unchanged
+        });
       } else {
         // Unknown content type - skip modifications
         return data;
@@ -351,23 +303,30 @@ export abstract class GuardrailsBaseClient {
   /**
    * Extract text content from various response types.
    */
-  protected extractResponseText(response: any): string {
-    const choice0 = response.choices?.[0];
-    const candidates = [
-      choice0?.delta?.content,
-      choice0?.message?.content,
-      response.output_text,
-      response.delta,
-    ];
-
-    for (const value of candidates) {
-      if (typeof value === 'string') {
-        return value || '';
-      }
+  protected extractResponseText(response: OpenAIResponseType): string {
+    // Handle Response type (no choices property)
+    if ('output' in response) {
+      return response.output_text || '';
     }
-
-    if (response.type === 'response.output_text.delta') {
-      return response.delta || '';
+    
+    // Handle other response types with choices
+    if ('choices' in response && response.choices) {
+      const choice0 = response.choices[0];
+      
+      // Handle ChatCompletion
+      if ('message' in choice0 && choice0.message) {
+        return choice0.message.content || '';
+      }
+      
+      // Handle Completion
+      if ('text' in choice0 && choice0.text) {
+        return choice0.text;
+      }
+      
+      // Handle streaming responses (ChatCompletionChunk)
+      if ('delta' in choice0 && choice0.delta) {
+        return choice0.delta.content || '';
+      }
     }
 
     return '';
@@ -399,7 +358,7 @@ export abstract class GuardrailsBaseClient {
   public async initializeClient(
     config: string | PipelineConfig,
     openaiArgs: ConstructorParameters<typeof OpenAI>[0],
-    clientClass: typeof OpenAI | any
+    clientClass: typeof OpenAI | typeof AzureOpenAI
   ): Promise<void> {
     // Create a separate OpenAI client instance for resource access
     // This avoids circular reference issues when overriding OpenAI's resource properties
@@ -418,13 +377,29 @@ export abstract class GuardrailsBaseClient {
    */
   protected abstract overrideResources(): void;
 
+
+  /**
+   * Determine if a guardrail should run based on content type compatibility.
+   * 
+   * Currently only supports text/plain content type matching.
+   * 
+   * @future To extend for multi-modal support:
+   * - Add image/*, audio/*, video/* pattern matching
+   * - Implement content type hierarchy (image/* matches image/jpeg, etc.)
+   * - Add wildcard support for broader compatibility
+   */
+  private shouldRunGuardrail(guardrail: ConfiguredGuardrail, detectedContentType: string): boolean {
+    return guardrail.definition.mediaType === detectedContentType;
+  }
+
+
   /**
    * Run guardrails for a specific pipeline stage.
    */
   public async runStageGuardrails(
     stageName: 'pre_flight' | 'input' | 'output',
     text: string,
-    conversationHistory?: any[],
+    conversationHistory?: Message[],
     suppressTripwire: boolean = false,
     raiseGuardrailErrors: boolean = false
   ): Promise<GuardrailResult[]> {
@@ -433,20 +408,48 @@ export abstract class GuardrailsBaseClient {
     }
 
     try {
-      // Check if prompt injection detection guardrail is present and we have conversation history
-      const hasInjectionDetection = this.guardrails[stageName].some(
-        (guardrail) => guardrail.definition.name.toLowerCase() === 'prompt injection detection'
+      // Content type detection - currently text-only
+      // @future: Add content analysis for multi-modal support (images, audio, video)
+      const detectedContentType = 'text/plain';
+      
+      // Filter guardrails based on content type compatibility
+      const compatibleGuardrails = this.guardrails[stageName].filter(guardrail => 
+        this.shouldRunGuardrail(guardrail, detectedContentType)
+      );
+
+      const skippedGuardrails = this.guardrails[stageName].filter(guardrail => 
+        !this.shouldRunGuardrail(guardrail, detectedContentType)
+      );
+
+      // Log warnings for skipped guardrails
+      if (skippedGuardrails.length > 0) {
+        console.warn(
+          `⚠️  Guardrails Warning: ${skippedGuardrails.length} guardrails skipped due to content type mismatch ` +
+          `(detected: ${detectedContentType}). Skipped: ${skippedGuardrails.map(g => g.definition.name).join(', ')}`
+        );
+      }
+
+      if (compatibleGuardrails.length === 0) {
+        console.warn(`No guardrails compatible with content type '${detectedContentType}' for stage '${stageName}'`);
+        return [];
+      }
+
+      // Check if any guardrail requires conversation history and we have it available
+      const needsConversationHistory = compatibleGuardrails.some(
+        (guardrail) => guardrail.definition.metadata?.requiresConversationHistory
       );
 
       let ctx = this.context;
-      if (hasInjectionDetection && conversationHistory) {
-        ctx = this.createContextWithConversation(conversationHistory);
+      if (needsConversationHistory && conversationHistory) {
+        // Filter to text-only for conversation history processing
+        const textOnlyHistory = ContentUtils.filterToTextOnly(conversationHistory);
+        ctx = this.createContextWithConversation(textOnlyHistory);
       }
 
       const results: GuardrailResult[] = [];
 
-      // Run guardrails in parallel using Promise.allSettled to capture all results
-      const guardrailPromises = this.guardrails[stageName].map(async (guardrail) => {
+      // Run compatible guardrails in parallel using Promise.allSettled to capture all results
+      const guardrailPromises = compatibleGuardrails.map(async (guardrail) => {
         try {
           const result = await guardrail.run(ctx, text);
           // Add stage and guardrail metadata
@@ -454,6 +457,8 @@ export abstract class GuardrailsBaseClient {
             ...result.info,
             stage_name: stageName,
             guardrail_name: guardrail.definition.name,
+            media_type: guardrail.definition.mediaType,
+            detected_content_type: detectedContentType,
           };
           return result;
         } catch (error) {
@@ -467,6 +472,8 @@ export abstract class GuardrailsBaseClient {
               checked_text: text, // Return original text on error
               stage_name: stageName,
               guardrail_name: guardrail.definition.name,
+              media_type: guardrail.definition.mediaType,
+              detected_content_type: detectedContentType,
               error: error instanceof Error ? error.message : String(error),
             },
           };
@@ -518,16 +525,21 @@ export abstract class GuardrailsBaseClient {
   }
 
   /**
-   * Create a context with conversation history for prompt injection detection guardrail.
+   * Create a context with conversation history for guardrails that require it.
+   * 
+   * @future To extend for multi-modal support:
+   * - Add support for image/audio content in conversation history
+   * - Implement content type filtering based on guardrail requirements
+   * - Add metadata about content types in the context
    */
-  protected createContextWithConversation(conversationHistory: any[]): GuardrailLLMContext {
-    // Create a new context that includes conversation history and prompt injection detection tracking
+  protected createContextWithConversation(conversationHistory: TextOnlyMessageArray): GuardrailLLMContext {
+    // Create a new context that includes conversation history and tracking metadata
     return {
       guardrailLlm: this.context.guardrailLlm,
       // Add conversation history methods
       getConversationHistory: () => conversationHistory,
     } as GuardrailLLMContext & {
-      getConversationHistory(): any[];
+      getConversationHistory(): TextOnlyMessageArray;
     };
   }
 
@@ -535,9 +547,9 @@ export abstract class GuardrailsBaseClient {
    * Append LLM response to conversation history.
    */
   protected appendLlmResponseToConversation(
-    conversationHistory: any[] | string | null,
-    llmResponse: any
-  ): any[] {
+    conversationHistory: TextOnlyMessageArray | string | null,
+    llmResponse: OpenAIResponseType
+  ): TextOnlyMessageArray {
     if (!conversationHistory) {
       conversationHistory = [];
     }
@@ -551,16 +563,36 @@ export abstract class GuardrailsBaseClient {
     const updatedHistory = [...conversationHistory];
 
     // For responses API: append the output directly
-    if (llmResponse.output && Array.isArray(llmResponse.output)) {
-      updatedHistory.push(...llmResponse.output);
+    if ('output' in llmResponse && llmResponse.output && Array.isArray(llmResponse.output)) {
+      // Convert ResponseOutputItem to TextOnlyMessage format
+      const convertedOutput = llmResponse.output
+        .filter(item => 'role' in item && 'content' in item)
+        .map(item => {
+          const itemWithRole = item as { role: string; content: unknown };
+          return {
+            role: itemWithRole.role,
+            content: itemWithRole.content as TextOnlyContent
+          };
+        });
+      updatedHistory.push(...convertedOutput);
     }
     // For chat completions: append the choice message directly (prompt injection detection check will parse)
     else if (
+      'choices' in llmResponse &&
       llmResponse.choices &&
       Array.isArray(llmResponse.choices) &&
-      llmResponse.choices.length > 0
+      llmResponse.choices.length > 0 &&
+      'message' in llmResponse.choices[0] &&
+      llmResponse.choices[0].message &&
+      llmResponse.choices[0].message.content
     ) {
-      updatedHistory.push(llmResponse.choices[0].message);
+      const message = llmResponse.choices[0].message;
+      if (message.content) {
+        updatedHistory.push({
+          role: message.role,
+          content: message.content
+        });
+      }
     }
 
     return updatedHistory;
@@ -573,7 +605,7 @@ export abstract class GuardrailsBaseClient {
     llmResponse: T,
     preflightResults: GuardrailResult[],
     inputResults: GuardrailResult[],
-    conversationHistory?: any[],
+    conversationHistory?: TextOnlyMessageArray,
     suppressTripwire: boolean = false
   ): Promise<GuardrailsResponse<T>> {
     // Create complete conversation history including the LLM response
