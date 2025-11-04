@@ -90,6 +90,17 @@ function isNotFoundError(error: unknown): boolean {
 }
 
 /**
+ * Ensure a value is an Error instance.
+ * Converts non-Error values to Error instances with a string representation.
+ *
+ * @param error The error value to convert
+ * @returns An Error instance
+ */
+function ensureError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
  * Call the OpenAI moderation API.
  *
  * @param client The OpenAI client to use
@@ -144,8 +155,9 @@ export const moderationCheck: CheckFn<ModerationContext, string, ModerationConfi
   if (ctx) {
     const contextObj = ctx as Record<string, unknown>;
     const candidate = contextObj.guardrailLlm;
-    if (candidate && candidate instanceof OpenAI) {
-      client = candidate;
+    // Just use whatever is provided, let the try-catch handle validation
+    if (candidate) {
+      client = candidate as OpenAI;
     }
   }
 
@@ -162,25 +174,32 @@ export const moderationCheck: CheckFn<ModerationContext, string, ModerationConfi
           try {
             resp = await callModerationAPI(new OpenAI(), data);
           } catch (fallbackError) {
-            // If fallback fails, provide a helpful error message
-            const errorMessage = fallbackError instanceof Error 
-              ? fallbackError.message 
-              : String(fallbackError);
-            
-            // Check if it's an API key error
-            if (errorMessage.includes('api_key') || errorMessage.includes('OPENAI_API_KEY')) {
-              return {
-                tripwireTriggered: false,
-                info: {
-                  checked_text: data,
-                  error: 'Moderation API requires OpenAI API key. Set OPENAI_API_KEY environment variable or pass a client with valid credentials.',
-                },
-              };
-            }
-            throw fallbackError;
+            // If fallback fails, return execution failure
+            // This allows runGuardrails to handle based on raiseGuardrailErrors flag
+            const errorObj = ensureError(fallbackError);
+            return {
+              tripwireTriggered: false,
+              executionFailed: true,
+              originalException: errorObj,
+              info: {
+                checked_text: data,
+                error: errorObj.message,
+              },
+            };
           }
         } else {
-          throw error;
+          // Non-404 error from context client - return execution failure
+          // This allows runGuardrails to handle based on raiseGuardrailErrors flag
+          const errorObj = ensureError(error);
+          return {
+            tripwireTriggered: false,
+            executionFailed: true,
+            originalException: errorObj,
+            info: {
+              checked_text: data,
+              error: errorObj.message,
+            },
+          };
         }
       }
     } else {
@@ -230,11 +249,14 @@ export const moderationCheck: CheckFn<ModerationContext, string, ModerationConfi
     };
   } catch (error) {
     console.warn('AI-based moderation failed:', error);
+    const errorObj = ensureError(error);
     return {
       tripwireTriggered: false,
+      executionFailed: true,
+      originalException: errorObj,
       info: {
         checked_text: data,
-        error: 'Moderation API call failed',
+        error: errorObj.message,
       },
     };
   }
