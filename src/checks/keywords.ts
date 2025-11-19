@@ -40,6 +40,15 @@ export type KeywordsContext = z.infer<typeof KeywordsContext>;
  * @param config Configuration specifying keywords and behavior
  * @returns GuardrailResult indicating if tripwire was triggered
  */
+const WORD_CHAR_CLASS = '[\\p{L}\\p{N}_]';
+const isWordChar = (() => {
+  const wordCharRegex = new RegExp(WORD_CHAR_CLASS, 'u');
+  return (char: string | undefined): boolean => {
+    if (!char) return false;
+    return wordCharRegex.test(char);
+  };
+})();
+
 export const keywordsCheck: CheckFn<KeywordsContext, string, KeywordsConfig> = (
   ctx,
   text,
@@ -52,13 +61,40 @@ export const keywordsCheck: CheckFn<KeywordsContext, string, KeywordsConfig> = (
   // Sanitize keywords by stripping trailing punctuation
   const sanitizedKeywords = keywords.map((k: string) => k.replace(/[.,!?;:]+$/, ''));
 
-  // Create regex pattern with word boundaries
-  // Escape special regex characters and join with word boundaries
-  const escapedKeywords = sanitizedKeywords.map((k: string) =>
-    k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  );
-  const patternText = `\\b(?:${escapedKeywords.join('|')})\\b`;
-  const pattern = new RegExp(patternText, 'gi'); // case-insensitive, global
+  const keywordEntries = sanitizedKeywords
+    .map((sanitized) => ({
+      sanitized,
+      escaped: sanitized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+    }))
+    .filter(({ sanitized }) => sanitized.length > 0);
+
+  if (keywordEntries.length === 0) {
+    return {
+      tripwireTriggered: false,
+      info: {
+        matchedKeywords: [],
+        originalKeywords: keywords,
+        sanitizedKeywords,
+        totalKeywords: keywords.length,
+        textLength: text.length,
+      },
+    };
+  }
+
+  // Apply unicode-aware word boundaries per keyword so tokens that start/end with punctuation still match.
+  const keywordPatterns = keywordEntries.map(({ sanitized, escaped }) => {
+    const keywordChars = Array.from(sanitized);
+    const firstChar = keywordChars[0];
+    const lastChar = keywordChars[keywordChars.length - 1];
+    const needsLeftBoundary = isWordChar(firstChar);
+    const needsRightBoundary = isWordChar(lastChar);
+    const leftBoundary = needsLeftBoundary ? `(?<!${WORD_CHAR_CLASS})` : '';
+    const rightBoundary = needsRightBoundary ? `(?!${WORD_CHAR_CLASS})` : '';
+    return `${leftBoundary}${escaped}${rightBoundary}`;
+  });
+
+  const patternText = `(?:${keywordPatterns.join('|')})`;
+  const pattern = new RegExp(patternText, 'giu'); // case-insensitive, global, unicode aware
 
   const matches: string[] = [];
   let match;
