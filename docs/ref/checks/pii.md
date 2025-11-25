@@ -24,9 +24,44 @@ Detects personally identifiable information (PII) such as SSNs, phone numbers, c
 
 ### Parameters
 
-- **`entities`** (required): List of PII entity types to detect. See the `PIIEntity` enum in `src/checks/pii.ts` for the full list, including custom entities such as `CVV` (credit card security codes) and `BIC_SWIFT` (bank identification codes).
+- **`entities`** (optional): List of PII entity types to detect. Defaults to all entities except `NRP` and `PERSON` (see note below). See the `PIIEntity` enum in `src/checks/pii.ts` for the full list, including custom entities such as `CVV` (credit card security codes) and `BIC_SWIFT` (bank identification codes).
 - **`block`** (optional): Whether to block content or just mask PII (default: `false`)
 - **`detect_encoded_pii`** (optional): If `true`, detects PII in Base64/URL-encoded/hex strings (default: `false`)
+
+### Important: NRP and PERSON Entity Deprecation
+
+**As of v0.1.8**, the `NRP` and `PERSON` entities have been **removed from the default entity list** due to their high false positive rates. These patterns are overly broad and cause issues in production:
+
+- **`NRP`** matches any two consecutive words (e.g., "nuevo cliente", "crea un", "the user")
+- **`PERSON`** matches any two capitalized words (e.g., "New York", "The User", "European Union")
+
+**Impact:**
+- ❌ Causes false positives in natural language conversation
+- ❌ Particularly problematic for non-English languages (Spanish, French, etc.)
+- ❌ Breaks normal text in pre-flight masking mode
+
+**Migration Path:**
+
+If you need to detect person names or national registration numbers, consider these alternatives:
+
+1. **For National Registration Numbers**: Use region-specific patterns instead:
+   - `SG_NRIC_FIN` (Singapore)
+   - `UK_NINO` (UK National Insurance Number)
+   - `FI_PERSONAL_IDENTITY_CODE` (Finland)
+   - `KR_RRN` (Korea Resident Registration Number)
+
+2. **For Person Names**: Consider using a dedicated NER (Named Entity Recognition) service or LLM-based detection for more accurate results.
+
+3. **If you still need these patterns**: You can explicitly include them in your configuration, but be aware of the false positives:
+   ```json
+   {
+       "entities": ["NRP", "PERSON", "EMAIL_ADDRESS"],
+       "block": false
+   }
+   ```
+   A deprecation warning will be logged when these entities are used.
+
+**Reference:** [Issue #47](https://github.com/openai/openai-guardrails-js/issues/47)
 
 ## Implementation Notes
 
