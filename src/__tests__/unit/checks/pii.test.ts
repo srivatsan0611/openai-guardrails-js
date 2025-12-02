@@ -293,6 +293,11 @@ describe('pii guardrail', () => {
       _clearDeprecationWarnings();
     });
 
+    afterEach(() => {
+      // Restore all mocks to prevent leaking between tests
+      vi.restoreAllMocks();
+    });
+
     it('excludes NRP and PERSON from default entities', () => {
       const config = PIIConfig.parse({});
 

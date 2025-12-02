@@ -30,15 +30,18 @@ Detects personally identifiable information (PII) such as SSNs, phone numbers, c
 
 ### Important: NRP and PERSON Entity Deprecation
 
-**As of v0.1.8**, the `NRP` and `PERSON` entities have been **removed from the default entity list** due to their high false positive rates. These patterns are overly broad and cause issues in production:
+**As of v0.2.0**, the `NRP` and `PERSON` entities have been **removed from the default entity list** due to their high false positive rates. These patterns are overly broad and cause issues in production:
 
 - **`NRP`** matches any two consecutive words (e.g., "nuevo cliente", "crea un", "the user")
 - **`PERSON`** matches any two capitalized words (e.g., "New York", "The User", "European Union")
 
 **Impact:**
+
 - ❌ Causes false positives in natural language conversation
 - ❌ Particularly problematic for non-English languages (Spanish, French, etc.)
 - ❌ Breaks normal text in pre-flight masking mode
+
+> **Future Improvement:** More robust implementations of `NRP` and `PERSON` detection are planned for a future release. Stay tuned for updates.
 
 **Migration Path:**
 

@@ -157,7 +157,7 @@ export enum PIIEntity {
  * include these entities in your configuration, or use more specific region-based
  * patterns like SG_NRIC_FIN, UK_NINO, etc.
  */
-const DEFAULT_PII_ENTITIES = Object.values(PIIEntity).filter(
+const DEFAULT_PII_ENTITIES: PIIEntity[] = Object.values(PIIEntity).filter(
   (entity) => entity !== PIIEntity.NRP && entity !== PIIEntity.PERSON
 );
 
