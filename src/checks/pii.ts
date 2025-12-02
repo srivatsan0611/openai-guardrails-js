@@ -893,13 +893,15 @@ function _warnDeprecatedEntities(entities: PIIEntity[]): void {
 
     shownDeprecationWarnings.add(entity);
 
+    const description =
+      entity === PIIEntity.NRP
+        ? 'NRP matches any two consecutive words'
+        : 'PERSON matches any two capitalized words';
+
     console.warn(
-      `[openai-guardrails-js] DEPRECATION WARNING: PIIEntity.${entity} has been removed from default entities due to high false positive rates.\n` +
-        `  - ${entity === PIIEntity.NRP ? 'NRP matches any two consecutive words (e.g., "nuevo cliente", "crea un")' : 'PERSON matches any two capitalized words (e.g., "New York", "The User")'}\n` +
-        `  - This pattern causes false positives in normal conversation, especially in non-English languages.\n` +
-        `  - Consider using more specific region-based patterns like SG_NRIC_FIN, UK_NINO, etc.\n` +
-        `  - To suppress this warning, remove PIIEntity.${entity} from your entities configuration.\n` +
-        `  - See: https://github.com/openai/openai-guardrails-js/issues/47`
+      `[openai-guardrails-js] DEPRECATION: PIIEntity.${entity} removed from defaults (${description}).\n` +
+        `  A more robust implementation will be released in a future version.\n` +
+        `  To suppress: remove PIIEntity.${entity} from config. See: https://github.com/openai/openai-guardrails-js/issues/47`
     );
   }
 }

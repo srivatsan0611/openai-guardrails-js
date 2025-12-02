@@ -376,10 +376,10 @@ describe('pii guardrail', () => {
       await pii({}, 'test data', config);
 
       expect(consoleWarnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('DEPRECATION WARNING: PIIEntity.NRP')
+        expect.stringContaining('DEPRECATION: PIIEntity.NRP')
       );
       expect(consoleWarnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('https://github.com/openai/openai-guardrails-js/issues/47')
+        expect.stringContaining('more robust implementation')
       );
 
       consoleWarnSpy.mockRestore();
@@ -396,10 +396,10 @@ describe('pii guardrail', () => {
       await pii({}, 'test data', config);
 
       expect(consoleWarnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('DEPRECATION WARNING: PIIEntity.PERSON')
+        expect.stringContaining('DEPRECATION: PIIEntity.PERSON')
       );
       expect(consoleWarnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('https://github.com/openai/openai-guardrails-js/issues/47')
+        expect.stringContaining('more robust implementation')
       );
 
       consoleWarnSpy.mockRestore();
