@@ -2,8 +2,8 @@
  * Unit tests for the PII guardrail functionality.
  */
 
-import { describe, it, expect } from 'vitest';
-import { pii, PIIConfig, PIIEntity } from '../../../checks/pii';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { pii, PIIConfig, PIIEntity, _clearDeprecationWarnings } from '../../../checks/pii';
 
 describe('pii guardrail', () => {
   it('masks detected PII when block=false', async () => {
@@ -285,5 +285,142 @@ describe('pii guardrail', () => {
       '782 Maple Ridge Ave, Austin, TX'
     );
     expect(result.info?.checked_text).toBe('Ship to <LOCATION> for delivery.');
+  });
+
+  describe('NRP and PERSON deprecation (Issue #47)', () => {
+    beforeEach(() => {
+      // Clear deprecation warnings before each test to ensure clean state
+      _clearDeprecationWarnings();
+    });
+
+    afterEach(() => {
+      // Restore all mocks to prevent leaking between tests
+      vi.restoreAllMocks();
+    });
+
+    it('excludes NRP and PERSON from default entities', () => {
+      const config = PIIConfig.parse({});
+
+      expect(config.entities).not.toContain(PIIEntity.NRP);
+      expect(config.entities).not.toContain(PIIEntity.PERSON);
+    });
+
+    it('does not mask common two-word phrases when using defaults', async () => {
+      const config = PIIConfig.parse({
+        block: false,
+      });
+      const text = 'crea un nuevo cliente con email test@gmail.com';
+
+      const result = await pii({}, text, config);
+
+      // Should only mask the email, not "crea un" or "nuevo cliente"
+      expect(result.info?.checked_text).toBe('crea un nuevo cliente con email <EMAIL_ADDRESS>');
+      expect((result.info?.detected_entities as Record<string, string[]>)?.NRP).toBeUndefined();
+    });
+
+    it('does not mask capitalized phrases when using defaults', async () => {
+      const config = PIIConfig.parse({
+        block: false,
+      });
+      const text = 'Welcome to New York, The User can access the system.';
+
+      const result = await pii({}, text, config);
+
+      // Should not mask "New York" or "The User"
+      expect(result.info?.checked_text).toBe('Welcome to New York, The User can access the system.');
+      expect((result.info?.detected_entities as Record<string, string[]>)?.PERSON).toBeUndefined();
+    });
+
+    it('still detects NRP when explicitly configured', async () => {
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const config = PIIConfig.parse({
+        entities: [PIIEntity.NRP],
+        block: false,
+      });
+      const text = 'hello world';
+
+      const result = await pii({}, text, config);
+
+      expect((result.info?.detected_entities as Record<string, string[]>)?.NRP).toEqual(['hello world']);
+      expect(result.info?.checked_text).toBe('<NRP>');
+
+      consoleWarnSpy.mockRestore();
+    });
+
+    it('still detects PERSON when explicitly configured', async () => {
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const config = PIIConfig.parse({
+        entities: [PIIEntity.PERSON],
+        block: false,
+      });
+      const text = 'John Smith lives in New York';
+
+      const result = await pii({}, text, config);
+
+      expect((result.info?.detected_entities as Record<string, string[]>)?.PERSON).toContain('John Smith');
+      expect((result.info?.detected_entities as Record<string, string[]>)?.PERSON).toContain('New York');
+
+      consoleWarnSpy.mockRestore();
+    });
+
+    it('shows deprecation warning for NRP', async () => {
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const config = PIIConfig.parse({
+        entities: [PIIEntity.NRP],
+        block: false,
+      });
+
+      await pii({}, 'test data', config);
+
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('DEPRECATION: PIIEntity.NRP')
+      );
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('more robust implementation')
+      );
+
+      consoleWarnSpy.mockRestore();
+    });
+
+    it('shows deprecation warning for PERSON', async () => {
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const config = PIIConfig.parse({
+        entities: [PIIEntity.PERSON],
+        block: false,
+      });
+
+      await pii({}, 'test data', config);
+
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('DEPRECATION: PIIEntity.PERSON')
+      );
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('more robust implementation')
+      );
+
+      consoleWarnSpy.mockRestore();
+    });
+
+    it('only shows deprecation warning once per entity', async () => {
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const config = PIIConfig.parse({
+        entities: [PIIEntity.NRP, PIIEntity.PERSON],
+        block: false,
+      });
+
+      await pii({}, 'test data', config);
+      await pii({}, 'more test data', config);
+      await pii({}, 'even more data', config);
+
+      // Should only be called once for each entity (2 total)
+      expect(consoleWarnSpy).toHaveBeenCalledTimes(2);
+
+      consoleWarnSpy.mockRestore();
+    });
   });
 });

@@ -145,8 +145,24 @@ export enum PIIEntity {
  *
  * Used to control which entity types are checked and the behavior mode.
  */
+/**
+ * Default PII entities to check.
+ *
+ * **IMPORTANT:** NRP and PERSON are excluded from defaults due to high false positive rates.
+ * These patterns match overly broad text patterns:
+ * - NRP: Matches any two consecutive words (e.g., "nuevo cliente", "crea un")
+ * - PERSON: Matches any two capitalized words (e.g., "New York", "The User")
+ *
+ * If you need to detect person names or national registration numbers, explicitly
+ * include these entities in your configuration, or use more specific region-based
+ * patterns like SG_NRIC_FIN, UK_NINO, etc.
+ */
+const DEFAULT_PII_ENTITIES: PIIEntity[] = Object.values(PIIEntity).filter(
+  (entity) => entity !== PIIEntity.NRP && entity !== PIIEntity.PERSON
+);
+
 export const PIIConfig = z.object({
-  entities: z.array(z.nativeEnum(PIIEntity)).default(() => Object.values(PIIEntity)),
+  entities: z.array(z.nativeEnum(PIIEntity)).default(() => DEFAULT_PII_ENTITIES),
   block: z
     .boolean()
     .default(false)
@@ -845,6 +861,52 @@ function _asResult(
 }
 
 /**
+ * Deprecated PII entities that have high false positive rates.
+ */
+const DEPRECATED_ENTITIES = new Set([PIIEntity.NRP, PIIEntity.PERSON]);
+
+/**
+ * Track which deprecation warnings have been shown to avoid spam.
+ */
+const shownDeprecationWarnings = new Set<string>();
+
+/**
+ * Clear deprecation warning cache. FOR TESTING ONLY.
+ * @internal
+ */
+export function _clearDeprecationWarnings(): void {
+  shownDeprecationWarnings.clear();
+}
+
+/**
+ * Warn users about deprecated PII entities with high false positive rates.
+ *
+ * @param entities The list of entities being checked
+ */
+function _warnDeprecatedEntities(entities: PIIEntity[]): void {
+  const deprecated = entities.filter((entity) => DEPRECATED_ENTITIES.has(entity));
+
+  for (const entity of deprecated) {
+    if (shownDeprecationWarnings.has(entity)) {
+      continue;
+    }
+
+    shownDeprecationWarnings.add(entity);
+
+    const description =
+      entity === PIIEntity.NRP
+        ? 'NRP matches any two consecutive words'
+        : 'PERSON matches any two capitalized words';
+
+    console.warn(
+      `[openai-guardrails-js] DEPRECATION: PIIEntity.${entity} removed from defaults (${description}).\n` +
+        `  A more robust implementation will be released in a future version.\n` +
+        `  To suppress: remove PIIEntity.${entity} from config. See: https://github.com/openai/openai-guardrails-js/issues/47`
+    );
+  }
+}
+
+/**
  * Async guardrail check_fn for PII entity detection in text.
  *
  * Analyzes text for any configured PII entity types and reports results. If
@@ -861,6 +923,9 @@ export const pii: CheckFn<Record<string, unknown>, string, PIIConfig> = async (
   data,
   config
 ): Promise<GuardrailResult> => {
+  // Warn about deprecated entities
+  _warnDeprecatedEntities(config.entities);
+
   const result = _detectPii(data, config);
   return _asResult(result, config, 'Contains PII', data);
 };
