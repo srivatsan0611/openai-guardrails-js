@@ -21,8 +21,13 @@ import {
   tokenUsageToDict,
 } from '../types';
 import { defaultSpecRegistry } from '../registry';
-import { LLMOutput, runLLM } from './llm-base';
+import { LLMOutput, LLMErrorOutput, runLLM } from './llm-base';
 import { parseConversationInput, normalizeConversation, NormalizedConversationEntry } from '../utils/conversation';
+
+/**
+ * Default maximum number of conversation turns for prompt injection detection.
+ */
+const DEFAULT_PID_MAX_TURNS = 10;
 
 /**
  * Configuration schema for the prompt injection detection guardrail.
@@ -44,6 +49,18 @@ export const PromptInjectionDetectionConfig = z.object({
     .default(false)
     .describe(
       'Whether to include detailed reasoning fields in the output. Defaults to false to minimize token costs.'
+    ),
+  /**
+   * Maximum number of conversation turns to include for multi-turn analysis.
+   * Defaults to 10. Set to 1 for single-turn mode.
+   */
+  max_turns: z
+    .number()
+    .int()
+    .min(1)
+    .default(DEFAULT_PID_MAX_TURNS)
+    .describe(
+      'Maximum number of conversation turns to include for multi-turn analysis. Defaults to 10. Set to 1 for single-turn mode.'
     ),
 });
 
@@ -191,6 +208,26 @@ const STRICT_JSON_INSTRUCTION =
   'Respond with ONLY a single JSON object containing the fields above. Do not add prose, markdown, or explanations outside the JSON.';
 
 /**
+ * Type guard to check if runLLM returned an error output.
+ */
+function isLLMErrorOutput(value: unknown): value is LLMErrorOutput {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  if (!('info' in value)) {
+    return false;
+  }
+
+  const info = (value as { info?: unknown }).info;
+  if (!info || typeof info !== 'object') {
+    return false;
+  }
+
+  return 'error_message' in info;
+}
+
+/**
  * Interface for user intent dictionary.
  */
 interface UserIntentDict {
@@ -218,9 +255,11 @@ export const promptInjectionDetectionCheck: CheckFn<
       );
     }
 
+    const maxTurns = config.max_turns ?? DEFAULT_PID_MAX_TURNS;
     const { recentMessages, actionableMessages, userIntent } = prepareConversationSlice(
       conversationHistory,
-      parsedDataMessages
+      parsedDataMessages,
+      maxTurns
     );
 
     const userGoalText = formatUserGoal(userIntent);
@@ -318,7 +357,8 @@ function safeGetConversationHistory(ctx: PromptInjectionDetectionContext): Norma
 
 function prepareConversationSlice(
   conversationHistory: NormalizedConversationEntry[],
-  parsedDataMessages: NormalizedConversationEntry[]
+  parsedDataMessages: NormalizedConversationEntry[],
+  maxTurns: number
 ): {
   recentMessages: NormalizedConversationEntry[];
   actionableMessages: NormalizedConversationEntry[];
@@ -327,17 +367,21 @@ function prepareConversationSlice(
   const historyMessages = Array.isArray(conversationHistory) ? conversationHistory : [];
   const datasetMessages = Array.isArray(parsedDataMessages) ? parsedDataMessages : [];
 
-  const sourceMessages = historyMessages.length > 0 ? historyMessages : datasetMessages;
+  // Apply max_turns limit to the conversation history
+  const limitedHistoryMessages = historyMessages.slice(-maxTurns);
+  const limitedDatasetMessages = datasetMessages.slice(-maxTurns);
+
+  const sourceMessages = limitedHistoryMessages.length > 0 ? limitedHistoryMessages : limitedDatasetMessages;
   let userIntent = extractUserIntentFromMessages(sourceMessages);
 
   let recentMessages = sliceMessagesAfterLatestUser(sourceMessages);
   let actionableMessages = extractActionableMessages(recentMessages);
 
-  if (actionableMessages.length === 0 && datasetMessages.length > 0 && historyMessages.length > 0) {
-    recentMessages = sliceMessagesAfterLatestUser(datasetMessages);
+  if (actionableMessages.length === 0 && limitedDatasetMessages.length > 0 && limitedHistoryMessages.length > 0) {
+    recentMessages = sliceMessagesAfterLatestUser(limitedDatasetMessages);
     actionableMessages = extractActionableMessages(recentMessages);
     if (!userIntent.most_recent_message) {
-      userIntent = extractUserIntentFromMessages(datasetMessages);
+      userIntent = extractUserIntentFromMessages(limitedDatasetMessages);
     }
   }
 
@@ -539,6 +583,18 @@ async function callPromptInjectionDetectionLLM(
       config.model,
       selectedOutputModel
     );
+
+    // Check if runLLM returned an error output (failed API call, JSON parsing, or schema validation)
+    if (isLLMErrorOutput(result)) {
+      const errorMsg = result.info?.error_message || 'LLM execution failed';
+      console.warn('Prompt injection detection LLM returned error output, using fallback', result.info);
+      return {
+        analysis: fallbackOutput,
+        tokenUsage,
+        executionFailed: true,
+        errorMessage: String(errorMsg),
+      };
+    }
 
     try {
       return {
