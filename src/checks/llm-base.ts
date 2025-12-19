@@ -13,12 +13,19 @@ import {
   CheckFn,
   GuardrailResult,
   GuardrailLLMContext,
+  GuardrailLLMContextWithHistory,
   TokenUsage,
   extractTokenUsage,
   tokenUsageToDict,
 } from '../types';
 import { defaultSpecRegistry } from '../registry';
 import { SAFETY_IDENTIFIER, supportsSafetyIdentifier } from '../utils/safety-identifier';
+import { NormalizedConversationEntry } from '../utils/conversation';
+
+/**
+ * Default maximum number of conversation turns to include for multi-turn analysis.
+ */
+export const DEFAULT_MAX_TURNS = 10;
 
 /**
  * Configuration schema for LLM-based content checks.
@@ -39,6 +46,28 @@ export const LLMConfig = z.object({
     ),
   /** Optional system prompt details for user-defined LLM guardrails */
   system_prompt_details: z.string().optional().describe('Additional system prompt details'),
+  /**
+   * Whether to include reasoning/explanation in guardrail output.
+   * Useful for development and debugging, but disabled by default in production to save tokens.
+   */
+  include_reasoning: z
+    .boolean()
+    .default(false)
+    .describe(
+      'Whether to include reasoning/explanation fields in the output. Defaults to false to minimize token costs.'
+    ),
+  /**
+   * Maximum number of conversation turns to include for multi-turn analysis.
+   * Defaults to 10. Set to 1 for single-turn mode.
+   */
+  max_turns: z
+    .number()
+    .int()
+    .min(1)
+    .default(DEFAULT_MAX_TURNS)
+    .describe(
+      'Maximum number of conversation turns to include for multi-turn analysis. Defaults to 10. Set to 1 for single-turn mode.'
+    ),
 });
 
 export type LLMConfig = z.infer<typeof LLMConfig>;
@@ -56,6 +85,19 @@ export const LLMOutput = z.object({
 });
 
 export type LLMOutput = z.infer<typeof LLMOutput>;
+
+/**
+ * Extended LLM output schema with reasoning.
+ *
+ * Extends LLMOutput to include a reason field explaining the decision.
+ * Used when include_reasoning is enabled in the config.
+ */
+export const LLMReasoningOutput = LLMOutput.extend({
+  /** Explanation of the guardrail decision */
+  reason: z.string(),
+});
+
+export type LLMReasoningOutput = z.infer<typeof LLMReasoningOutput>;
 
 /**
  * Extended LLM output schema with error information.
@@ -232,6 +274,54 @@ Analyze the following text according to the instructions above.
 }
 
 /**
+ * Extract conversation history from context if available.
+ *
+ * Safely attempts to retrieve conversation history from context objects
+ * that implement the GuardrailLLMContextWithHistory interface.
+ *
+ * @param ctx - Context object that may contain conversation history.
+ * @returns Array of conversation entries, or empty array if unavailable.
+ */
+export function extractConversationHistory(ctx: GuardrailLLMContext): NormalizedConversationEntry[] {
+  const candidate = (ctx as GuardrailLLMContextWithHistory).getConversationHistory;
+  if (typeof candidate !== 'function') {
+    return [];
+  }
+
+  try {
+    const history = candidate.call(ctx);
+    return Array.isArray(history) ? history : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Build analysis payload for multi-turn conversation analysis.
+ *
+ * Creates a JSON string containing the recent conversation history and the
+ * latest input text for LLM analysis.
+ *
+ * @param conversationHistory - Array of conversation entries.
+ * @param latestInput - The latest text input to analyze.
+ * @param maxTurns - Maximum number of conversation turns to include.
+ * @returns JSON string containing conversation and latest_input.
+ */
+export function buildAnalysisPayload(
+  conversationHistory: NormalizedConversationEntry[],
+  latestInput: string,
+  maxTurns: number
+): string {
+  const trimmedInput = typeof latestInput === 'string' ? latestInput.trim() : '';
+  const recentTurns = conversationHistory.slice(-maxTurns);
+
+  return JSON.stringify({
+    conversation: recentTurns,
+    latest_input: trimmedInput,
+  });
+}
+
+/**
  * Remove JSON code fencing (```json ... ```) from a response, if present.
  *
  * This function is defensive: it returns the input string unchanged unless
@@ -269,11 +359,16 @@ function stripJsonCodeFence(text: string): string {
  * Invokes the OpenAI LLM, enforces prompt/response contract, parses the LLM's
  * output, and returns a validated result.
  *
+ * When conversation history is provided, the analysis includes recent conversation
+ * context for multi-turn detection capabilities.
+ *
  * @param text - Text to analyze.
  * @param systemPrompt - Prompt instructions for the LLM.
  * @param client - OpenAI client for LLM inference.
  * @param model - Identifier for which LLM model to use.
  * @param outputModel - Model for parsing and validating the LLM's response.
+ * @param conversationHistory - Optional array of conversation entries for multi-turn analysis.
+ * @param maxTurns - Maximum number of conversation turns to include. Defaults to DEFAULT_MAX_TURNS.
  * @returns Structured output containing the detection decision and confidence.
  */
 export async function runLLM<TOutput extends ZodTypeAny>(
@@ -281,7 +376,9 @@ export async function runLLM<TOutput extends ZodTypeAny>(
   systemPrompt: string,
   client: OpenAI,
   model: string,
-  outputModel: TOutput
+  outputModel: TOutput,
+  conversationHistory?: NormalizedConversationEntry[] | null,
+  maxTurns: number = DEFAULT_MAX_TURNS
 ): Promise<[z.infer<TOutput> | LLMErrorOutput, TokenUsage]> {
   const fullPrompt = buildFullPrompt(systemPrompt, outputModel);
   const noUsage: TokenUsage = Object.freeze({
@@ -303,11 +400,22 @@ export async function runLLM<TOutput extends ZodTypeAny>(
       temperature = 1.0;
     }
 
+    // Build user content based on whether conversation history is provided
+    let userContent: string;
+    if (conversationHistory && conversationHistory.length > 0) {
+      // Multi-turn mode: include conversation history
+      const analysisPayload = buildAnalysisPayload(conversationHistory, text, maxTurns);
+      userContent = `# Analysis Input\n\n${analysisPayload}`;
+    } else {
+      // Single-turn mode: use text directly (strip whitespace for consistency)
+      userContent = `# Text\n\n${text.trim()}`;
+    }
+
     // Build API call parameters
     const params: Record<string, unknown> = {
       messages: [
         { role: 'system', content: fullPrompt },
-        { role: 'user', content: `# Text\n\n${text}` },
+        { role: 'user', content: userContent },
       ],
       model: model,
       temperature: temperature,
@@ -428,9 +536,12 @@ export function createLLMCheckFn(
   name: string,
   description: string,
   systemPrompt: string,
-  outputModel: typeof LLMOutput = LLMOutput,
+  outputModel?: typeof LLMOutput,
   configModel: typeof LLMConfig = LLMConfig
 ): CheckFn<GuardrailLLMContext, string, z.infer<typeof LLMConfig>> {
+  // Store the custom output model if provided
+  const customOutputModel = outputModel;
+
   async function guardrailFunc(
     ctx: GuardrailLLMContext,
     data: string,
@@ -446,12 +557,29 @@ export function createLLMCheckFn(
       );
     }
 
+    // Determine output model: custom model takes precedence, otherwise use include_reasoning
+    let selectedOutputModel: typeof LLMOutput;
+    if (customOutputModel !== undefined) {
+      // Always use the custom model if provided
+      selectedOutputModel = customOutputModel;
+    } else {
+      // No custom model: use include_reasoning to decide
+      const includeReasoning = config.include_reasoning ?? false;
+      selectedOutputModel = includeReasoning ? LLMReasoningOutput : LLMOutput;
+    }
+
+    // Extract conversation history from context for multi-turn analysis
+    const conversationHistory = extractConversationHistory(ctx);
+    const maxTurns = config.max_turns ?? DEFAULT_MAX_TURNS;
+
     const [analysis, tokenUsage] = await runLLM(
       data,
       renderedSystemPrompt,
       ctx.guardrailLlm as OpenAI, // Type assertion to handle OpenAI client compatibility
       config.model,
-      outputModel
+      selectedOutputModel,
+      conversationHistory,
+      maxTurns
     );
 
     if (isLLMErrorOutput(analysis)) {
@@ -477,7 +605,7 @@ export function createLLMCheckFn(
     'text/plain',
     configModel as z.ZodType<z.infer<typeof LLMConfig>>,
     LLMContext,
-    { engine: 'LLM' }
+    { engine: 'LLM', usesConversationHistory: true }
   );
 
   return guardrailFunc;

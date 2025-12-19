@@ -14,7 +14,8 @@ Flags model text containing factual claims that are clearly contradicted or not 
     "config": {
         "model": "gpt-4.1-mini",
         "confidence_threshold": 0.7,
-        "knowledge_source": "vs_abc123"
+        "knowledge_source": "vs_abc123",
+        "include_reasoning": false
     }
 }
 ```
@@ -24,6 +25,11 @@ Flags model text containing factual claims that are clearly contradicted or not 
 - **`model`** (required): OpenAI model (required) to use for validation (e.g., "gpt-4.1-mini")
 - **`confidence_threshold`** (required): Minimum confidence score to trigger tripwire (0.0 to 1.0)
 - **`knowledge_source`** (required): OpenAI vector store ID starting with "vs_" containing reference documents
+- **`include_reasoning`** (optional): Whether to include detailed reasoning fields in the output (default: `false`)
+    - When `false`: Returns only `flagged` and `confidence` to save tokens
+    - When `true`: Additionally, returns `reasoning`, `hallucination_type`, `hallucinated_statements`, and `verified_statements`
+    - **Performance**: In our evaluations, disabling reasoning reduces median latency by 40% on average (ranging from 18% to 67% depending on model) while maintaining detection performance
+    - **Use Case**: Keep disabled for production to minimize costs and latency; enable for development and debugging
 
 ### Tuning guidance
 
@@ -58,6 +64,7 @@ const config = {
                     model: "gpt-5",
                     confidence_threshold: 0.7,
                     knowledge_source: "vs_abc123",
+                    include_reasoning: false,
                 },
             },
         ],
@@ -103,7 +110,9 @@ See [`examples/`](https://github.com/openai/openai-guardrails-js/tree/main/examp
 
 ## What It Returns
 
-Returns a `GuardrailResult` with the following `info` dictionary:
+Returns a `GuardrailResult` with the following `info` dictionary.
+
+**With `include_reasoning=true`:**
 
 ```json
 {
@@ -114,19 +123,25 @@ Returns a `GuardrailResult` with the following `info` dictionary:
     "hallucination_type": "factual_error",
     "hallucinated_statements": ["Our premium plan costs $299/month"],
     "verified_statements": ["We offer customer support"],
-    "threshold": 0.7
+    "threshold": 0.7,
+    "token_usage": {
+        "prompt_tokens": 200,
+        "completion_tokens": 30,
+        "total_tokens": 230
+    }
 }
 ```
 
+### Fields
+
 - **`flagged`**: Whether the content was flagged as potentially hallucinated
 - **`confidence`**: Confidence score (0.0 to 1.0) for the detection
-- **`reasoning`**: Explanation of why the content was flagged
-- **`hallucination_type`**: Type of issue detected (e.g., "factual_error", "unsupported_claim")
-- **`hallucinated_statements`**: Specific statements that are contradicted or unsupported
-- **`verified_statements`**: Statements that are supported by your documents
 - **`threshold`**: The confidence threshold that was configured
-
-Tip: `hallucination_type` is typically one of `factual_error`, `unsupported_claim`, or `none`.
+- **`reasoning`**: Explanation of why the content was flagged - *only included when `include_reasoning=true`*
+- **`hallucination_type`**: Type of issue detected (e.g., "factual_error", "unsupported_claim", "none") - *only included when `include_reasoning=true`*
+- **`hallucinated_statements`**: Specific statements that are contradicted or unsupported - *only included when `include_reasoning=true`*
+- **`verified_statements`**: Statements that are supported by your documents - *only included when `include_reasoning=true`*
+- **`token_usage`**: Token usage details from the LLM call
 
 ## Benchmark Results
 
@@ -245,7 +260,7 @@ In addition to the above evaluations which use a 3 MB sized vector store, the ha
 **Key Insights:**
 
 - **Best Performance**: gpt-5-mini consistently achieves the highest ROC AUC scores across all vector store sizes (0.909-0.939)
-- **Best Latency**: gpt-4.1-mini shows the most consistent and lowest latency across all scales (6,661-7,374ms P50) while maintaining solid accuracy
+- **Best Latency**: gpt-4.1-mini (default) provides the lowest median latencies while maintaining strong accuracy
 - **Most Stable**: gpt-4.1-mini (default) maintains relatively stable performance across vector store sizes with good accuracy-latency balance
 - **Scale Sensitivity**: gpt-5 shows the most variability in performance across vector store sizes, with performance dropping significantly at larger scales
 - **Performance vs Scale**: Most models show decreasing performance as vector store size increases, with gpt-5-mini being the most resilient
